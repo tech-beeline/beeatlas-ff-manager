@@ -397,7 +397,13 @@ def _build_dashboard_fitness_function_response() -> DashboardFitnessFunctionBody
 def startup():
     ensure_scripts_dir(reset=True)
     init_schema()
-    init_bi_dashboards_schema()
+    try:
+        init_bi_dashboards_schema()
+    except Exception:
+        # Витрина bi_dashboards зависит от UNIQUE(alias) в product.product (fdm-products,
+        # миграция V0043) и не должна ронять старт ff-manager, если та ещё не раскатана
+        # в этом окружении. При следующем рестарте инициализация повторится.
+        log.exception("init_bi_dashboards_schema failed, continuing startup without it")
     materialize_missing_fitness_functions_from_scripts()
     materialize_missing_scripts_from_db()
 
