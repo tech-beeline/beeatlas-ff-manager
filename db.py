@@ -945,6 +945,17 @@ def init_schema():
             ALTER TABLE {SCHEMA}.fitness_function
             ADD COLUMN IF NOT EXISTS method_synchronous BOOLEAN NOT NULL DEFAULT false;
         """)
+        # Уникальность code нужна для внешнего FK из bi_dashboards.ff (см. init_bi_dashboards_schema).
+        cur.execute(f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'uq_fitness_function_code'
+                ) THEN
+                    ALTER TABLE {SCHEMA}.fitness_function ADD CONSTRAINT uq_fitness_function_code UNIQUE (code);
+                END IF;
+            END $$;
+        """)
         cur.execute(f"""
             ALTER TABLE {SCHEMA}.outside_ff
             ADD COLUMN IF NOT EXISTS is_check BOOLEAN;
@@ -1079,6 +1090,200 @@ def init_schema():
             (max_ff_id,),
         )
 
+    finally:
+        cur.close()
+        conn.close()
+
+
+BI_DASHBOARDS_SCHEMA = "bi_dashboards"
+
+
+def init_bi_dashboards_schema():
+    """
+    Схема bi_dashboards: витрина результатов ФФ для внешних потребителей (Qlik Sense и др.).
+    Реплицируется из ff.product_ff триггером trg_product_ff_replicate (AFTER INSERT).
+    Требует UNIQUE на product.product(alias) и ff.fitness_function(code) — см. init_schema()
+    и fdm-products миграцию V0043 (без них FK ниже не создастся).
+    """
+    conn = get_connection()
+    conn.autocommit = True
+    cur = conn.cursor()
+    try:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {BI_DASHBOARDS_SCHEMA};")
+        cur.execute(f"""
+            COMMENT ON SCHEMA {BI_DASHBOARDS_SCHEMA} IS
+            'BI Хранилище артефактов (результатов фитнес-функций и иных оценок) для потребления сторонними системами (Qlik Sense и др.). Заменяет устаревшую public.fdm_ptr_artifacts.';
+        """)
+
+        cur.execute(f"""
+            CREATE SEQUENCE IF NOT EXISTS {BI_DASHBOARDS_SCHEMA}.seq_ff_id
+                AS BIGINT START 1 INCREMENT 1 NO CYCLE;
+        """)
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {BI_DASHBOARDS_SCHEMA}.ff (
+                id BIGINT NOT NULL DEFAULT nextval('{BI_DASHBOARDS_SCHEMA}.seq_ff_id'),
+                product_alias VARCHAR NOT NULL,
+                ff_code VARCHAR(100) NULL,
+                is_check BOOLEAN NOT NULL,
+                is_actual BOOLEAN NOT NULL DEFAULT true,
+                assessed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                details JSONB NULL,
+                count_detail INTEGER NULL,
+                success_detail INTEGER NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT pk_bi_dashboards_ff PRIMARY KEY (id),
+                CONSTRAINT fk_bi_dashboards_ff_product_alias
+                    FOREIGN KEY (product_alias) REFERENCES product.product (alias)
+                    ON DELETE CASCADE,
+                CONSTRAINT fk_bi_dashboards_ff_code
+                    FOREIGN KEY (ff_code) REFERENCES {SCHEMA}.fitness_function (code)
+                    ON DELETE SET NULL,
+                CONSTRAINT chk_bi_dashboards_ff_counts
+                    CHECK (success_detail IS NULL OR count_detail IS NULL OR success_detail <= count_detail)
+            );
+        """)
+
+        cur.execute(f"""
+            COMMENT ON TABLE {BI_DASHBOARDS_SCHEMA}.ff IS
+            'Результаты фитнес-функций и иных оценок для систем. Наполняется триггером на ff.product_ff.';
+        """)
+        cur.execute(f"""
+            COMMENT ON COLUMN {BI_DASHBOARDS_SCHEMA}.ff.product_alias IS
+            'Ссылка на product.product.alias (CMDB-мнемоника системы).';
+        """)
+        cur.execute(f"""
+            COMMENT ON COLUMN {BI_DASHBOARDS_SCHEMA}.ff.ff_code IS
+            'Код фитнес-функции в ff.fitness_function.code.';
+        """)
+        cur.execute(f"""
+            COMMENT ON COLUMN {BI_DASHBOARDS_SCHEMA}.ff.is_check IS
+            'Результат: true=pass, false=fail.';
+        """)
+        cur.execute(f"""
+            COMMENT ON COLUMN {BI_DASHBOARDS_SCHEMA}.ff.is_actual IS
+            'Актуальная ли запись. При новом результате предыдущие is_actual=false.';
+        """)
+        cur.execute(f"""
+            COMMENT ON COLUMN {BI_DASHBOARDS_SCHEMA}.ff.assessed_at IS
+            'Время оценки (бывш. *_ts в fdm_ptr_artifacts).';
+        """)
+        cur.execute(f"""
+            COMMENT ON COLUMN {BI_DASHBOARDS_SCHEMA}.ff.details IS
+            'Произвольные метаданные результата (jsonb).';
+        """)
+
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_bi_dashboards_art_product_alias
+                ON {BI_DASHBOARDS_SCHEMA}.ff (product_alias);
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_bi_dashboards_art_ff_code
+                ON {BI_DASHBOARDS_SCHEMA}.ff (ff_code);
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_bi_dashboards_art_is_actual
+                ON {BI_DASHBOARDS_SCHEMA}.ff (is_actual);
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_bi_dashboards_art_assessed_at
+                ON {BI_DASHBOARDS_SCHEMA}.ff (assessed_at);
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_bi_dashboards_art_product_actual
+                ON {BI_DASHBOARDS_SCHEMA}.ff (product_alias, is_actual);
+        """)
+
+        # Partial unique index вместо UNIQUE(product_alias, ff_code, is_actual): последнее ограничивало
+        # бы и is_actual=false, что ломается начиная с 3-й оценки одной и той же пары (накопление истории).
+        # Здесь же ограничивается только "текущая" строка на пару (product_alias, ff_code).
+        cur.execute(f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS uk_bi_dashboards_ff_actual
+                ON {BI_DASHBOARDS_SCHEMA}.ff (product_alias, ff_code)
+                WHERE is_actual = true;
+        """)
+
+        cur.execute(f"""
+            CREATE OR REPLACE FUNCTION {BI_DASHBOARDS_SCHEMA}.fn_set_updated_at()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+              NEW.updated_at = CURRENT_TIMESTAMP;
+              RETURN NEW;
+            END;
+            $$;
+        """)
+        cur.execute(f"""
+            DROP TRIGGER IF EXISTS trg_ff_updated_at ON {BI_DASHBOARDS_SCHEMA}.ff;
+        """)
+        cur.execute(f"""
+            CREATE TRIGGER trg_ff_updated_at
+                BEFORE UPDATE ON {BI_DASHBOARDS_SCHEMA}.ff
+                FOR EACH ROW EXECUTE FUNCTION {BI_DASHBOARDS_SCHEMA}.fn_set_updated_at();
+        """)
+
+        cur.execute(f"""
+            CREATE OR REPLACE FUNCTION {BI_DASHBOARDS_SCHEMA}.fn_replicate_product_ff()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $$
+            DECLARE
+              v_ff_code VARCHAR(100);
+            BEGIN
+              -- 1. Получить код фитнес-функции по ff_id
+              SELECT code
+                INTO v_ff_code
+                FROM {SCHEMA}.fitness_function
+               WHERE id = NEW.ff_id;
+
+              IF v_ff_code IS NULL THEN
+                -- Фитнес-функция не найдена — пропускаем репликацию
+                RETURN NEW;
+              END IF;
+
+              -- 2. Снять флаг is_actual с предыдущих актуальных записей
+              UPDATE {BI_DASHBOARDS_SCHEMA}.ff
+                 SET is_actual = false,
+                     updated_at = CURRENT_TIMESTAMP
+               WHERE product_alias = NEW.product_code
+                 AND ff_code = v_ff_code
+                 AND is_actual = true;
+
+              -- 3. Вставить новую актуальную запись
+              INSERT INTO {BI_DASHBOARDS_SCHEMA}.ff
+                (product_alias, ff_code, is_check, is_actual,
+                 assessed_at, details, count_detail, success_detail,
+                 created_at, updated_at)
+              VALUES
+                (NEW.product_code, v_ff_code, NEW.is_check,
+                 COALESCE(NEW.is_actual, true),
+                 COALESCE(NEW.create_date, CURRENT_TIMESTAMP),
+                 NULLIF(NEW.json_details, '')::jsonb, NEW.count_detail, NEW.success_detail,
+                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
+              RETURN NEW;
+            END;
+            $$;
+        """)
+        cur.execute(f"""
+            COMMENT ON FUNCTION {BI_DASHBOARDS_SCHEMA}.fn_replicate_product_ff() IS
+            'Триггерная функция: реплицирует INSERT из ff.product_ff в bi_dashboards.ff. Срабатывает при записи результата фитнес-функции через ff-manager API.';
+        """)
+
+        cur.execute(f"""
+            DROP TRIGGER IF EXISTS trg_product_ff_replicate ON {SCHEMA}.product_ff;
+        """)
+        cur.execute(f"""
+            CREATE TRIGGER trg_product_ff_replicate
+                AFTER INSERT ON {SCHEMA}.product_ff
+                FOR EACH ROW EXECUTE FUNCTION {BI_DASHBOARDS_SCHEMA}.fn_replicate_product_ff();
+        """)
+        cur.execute(f"""
+            COMMENT ON TRIGGER trg_product_ff_replicate ON {SCHEMA}.product_ff IS
+            'Репликация результатов фитнес-функций в bi_dashboards.ff для потребления сторонними системами (Qlik Sense).';
+        """)
     finally:
         cur.close()
         conn.close()
