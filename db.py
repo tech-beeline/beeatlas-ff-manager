@@ -945,7 +945,7 @@ def init_schema():
             ALTER TABLE {SCHEMA}.fitness_function
             ADD COLUMN IF NOT EXISTS method_synchronous BOOLEAN NOT NULL DEFAULT false;
         """)
-        # Уникальность code нужна для внешнего FK из bi_dashboards.ff (см. init_bi_dashboards_schema).
+        # Уникальность code: инвариант справочника ФФ, на нём же строится поиск по коду.
         cur.execute(f"""
             DO $$
             BEGIN
@@ -1102,13 +1102,29 @@ def init_bi_dashboards_schema():
     """
     Схема bi_dashboards: витрина результатов ФФ для внешних потребителей (Qlik Sense и др.).
     Реплицируется из ff.product_ff триггером trg_product_ff_replicate (AFTER INSERT).
-    Требует UNIQUE на product.product(alias) и ff.fitness_function(code) — см. init_schema()
-    и fdm-products миграцию V0043 (без них FK ниже не создастся).
+    FK на product.product(alias) и ff.fitness_function(code) намеренно не создаются:
+    витрина не должна зависеть от внешних схем (см. корректирующую миграцию в начале).
     """
     conn = get_connection()
     conn.autocommit = True
     cur = conn.cursor()
     try:
+        # Корректирующая миграция (SFDM-4109): витрина не должна зависеть от внешних схем
+        # (product.product, ff.fitness_function). FK блокировали удаление продуктов и ФФ
+        # и требовали раскатанной V0043 в fdm-products. Целостность обеспечивает триггер
+        # fn_replicate_product_ff, который пишет только существующие product_code/ff_code.
+        # Идёт первой в функции: на уже развёрнутых окружениях таблица существует, и снятие
+        # FK не должно зависеть от успеха остальных DDL ниже (autocommit — каждый ALTER
+        # фиксируется отдельно).
+        cur.execute(f"""
+            ALTER TABLE IF EXISTS {BI_DASHBOARDS_SCHEMA}.ff
+                DROP CONSTRAINT IF EXISTS fk_bi_dashboards_ff_product_alias;
+        """)
+        cur.execute(f"""
+            ALTER TABLE IF EXISTS {BI_DASHBOARDS_SCHEMA}.ff
+                DROP CONSTRAINT IF EXISTS fk_bi_dashboards_ff_code;
+        """)
+
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {BI_DASHBOARDS_SCHEMA};")
         cur.execute(f"""
             COMMENT ON SCHEMA {BI_DASHBOARDS_SCHEMA} IS
@@ -1134,12 +1150,6 @@ def init_bi_dashboards_schema():
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 CONSTRAINT pk_bi_dashboards_ff PRIMARY KEY (id),
-                CONSTRAINT fk_bi_dashboards_ff_product_alias
-                    FOREIGN KEY (product_alias) REFERENCES product.product (alias)
-                    ON DELETE CASCADE,
-                CONSTRAINT fk_bi_dashboards_ff_code
-                    FOREIGN KEY (ff_code) REFERENCES {SCHEMA}.fitness_function (code)
-                    ON DELETE SET NULL,
                 CONSTRAINT chk_bi_dashboards_ff_counts
                     CHECK (success_detail IS NULL OR count_detail IS NULL OR success_detail <= count_detail)
             );

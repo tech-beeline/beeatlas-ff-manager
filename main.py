@@ -400,9 +400,9 @@ def startup():
     try:
         init_bi_dashboards_schema()
     except Exception:
-        # Витрина bi_dashboards зависит от UNIQUE(alias) в product.product (fdm-products,
-        # миграция V0043) и не должна ронять старт ff-manager, если та ещё не раскатана
-        # в этом окружении. При следующем рестарте инициализация повторится.
+        # Витрина bi_dashboards не должна ронять старт ff-manager: если её инициализация
+        # не прошла (нет прав на CREATE SCHEMA и т.п.), сервис поднимается без неё.
+        # При следующем рестарте инициализация повторится.
         log.exception("init_bi_dashboards_schema failed, continuing startup without it")
     materialize_missing_fitness_functions_from_scripts()
     materialize_missing_scripts_from_db()
