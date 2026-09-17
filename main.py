@@ -46,6 +46,7 @@ from db import (
     find_missing_ff_code,
     get_products_passed_ff_codes,
 )
+from branch import normalize_branch_name
 from ff_runner import run_ff_check
 from ff_status import FF_STATUS_ADOPT, FF_STATUS_TEST, normalize_ff_status, skips_applicability_check
 from run_result import check_result_from_outside_ff_row
@@ -212,6 +213,7 @@ class ActualResultRow(BaseModel):
 
     id: int = Field(..., description="Идентификатор строки product_ff")
     product_code: str
+    branch: str = Field(..., description="Ветка продукта")
     ff_id: int
     ff_code: str
     ff_description: str
@@ -245,6 +247,7 @@ class ProductActualResultsBody(BaseModel):
     """Тело ответа со списком актуальных результатов проверок по продукту."""
 
     product_code: str
+    branch: str
     results: list[ActualResultRow]
 
 
@@ -258,6 +261,7 @@ class ProductFfHistoryBody(BaseModel):
     """История прохождений одной проверки по продукту (от новых к старым)."""
 
     product_code: str
+    branch: str
     ff_code: str
     history: list[ProductFfHistoryRow]
 
@@ -444,6 +448,19 @@ class RunRequest(BaseModel):
     app: str
 
 
+_BRANCH_QUERY_DESCRIPTION = (
+    "Ветка продукта. Можно не передавать — тогда main; пустое значение (?branch=) — 400. "
+    "Без учёта регистра."
+)
+
+
+def _branch_from_query(branch: Optional[str]) -> str:
+    try:
+        return normalize_branch_name(branch)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 def _normalize_run_source(
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
@@ -553,6 +570,7 @@ def _product_ff_row_to_api(r: dict, *, include_is_actual: bool = False) -> dict[
     item: dict[str, Any] = {
         "id": r["id"],
         "product_code": r["product_code"],
+        "branch": r["branch"],
         "ff_id": r["ff_id"],
         "ff_code": r["ff_code"],
         "ff_description": r["ff_description"],
@@ -878,10 +896,11 @@ def _prerequisites_satisfied(
     product_code: str,
     applicability: Optional[str],
     code_to_id: dict[str, int],
+    branch: str,
 ) -> bool:
     """
     Проверка по product_ff: для каждого кода в applicability (через запятую)
-    должна быть актуальная запись с is_check = true.
+    должна быть актуальная запись ветки branch с is_check = true.
     Пустая applicability — всегда True.
     """
     if _applicability_empty(applicability):
@@ -894,7 +913,7 @@ def _prerequisites_satisfied(
         ff_id = code_to_id.get(prereq_code)
         if ff_id is None:
             return False
-        if not product_has_actual_ff_pass(key, ff_id):
+        if not product_has_actual_ff_pass(key, ff_id, branch):
             return False
     return True
 
@@ -945,10 +964,12 @@ def run_one(
         default=None,
         description="Идентификатор источника запуска (игнорируется без source_type)",
     ),
+    branch: Optional[str] = Query(default=None, description=_BRANCH_QUERY_DESCRIPTION),
 ):
     """
     Запуск проверки для продукта: скрипт .py или POST на URL из fitness_function.method.
     В теле запроса передаётся мнемоника приложения (поле app).
+    Результат и applicability считаются для ветки **branch** (по умолчанию main).
     Для статуса **TEST** applicability не проверяется; результат не сохраняется в product_ff.
     Для **TRIAL** и **ADOPT** проверяется applicability.
     детали расчёта возвращаются в **check_result** (is_check, details, countDetail, successDetail).
@@ -959,6 +980,7 @@ def run_one(
     app_code = body.app.strip()
     if not app_code:
         raise HTTPException(status_code=400, detail="Поле app не может быть пустым")
+    run_branch = _branch_from_query(branch)
 
     ff_row = get_fitness_function_by_code(code)
     run_code = (ff_row.get("code") or code.strip()) if ff_row else code.strip()
@@ -966,7 +988,7 @@ def run_one(
         ff_app_map = get_fitness_function_applicabilities()
         code_to_id = get_fitness_function_code_to_id()
         applicability = ff_app_map.get(run_code)
-        if not _prerequisites_satisfied(app_code, applicability, code_to_id):
+        if not _prerequisites_satisfied(app_code, applicability, code_to_id, run_branch):
             raise HTTPException(
                 status_code=400,
                 detail=f"Правило проверки '{run_code}' неприменимо для продукта '{body.app}' "
@@ -997,12 +1019,14 @@ def run_one(
         doc_id=doc_id_param,
         source_type=run_source_type,
         source_id=run_source_id,
+        branch=run_branch,
     )
     if not success:
         raise HTTPException(status_code=400, detail=message)
     out: dict[str, Any] = {
         "code": run_code,
         "app": body.app,
+        "branch": run_branch,
         "success": True,
         "message": message,
         "check_result": check_result,
@@ -1032,16 +1056,19 @@ def run_all(
         default=None,
         description="Идентификатор источника запуска (игнорируется без source_type)",
     ),
+    branch: Optional[str] = Query(default=None, description=_BRANCH_QUERY_DESCRIPTION),
 ):
     """
     Запуск проверок для приложения: скрипты .py и внешние POST (fitness_function.method).
     Проверки со статусом **TEST** не запускаются.
     Сначала — с applicability = NULL, затем остальные по мере выполнения предусловий в product_ff.
     В **check_result** каждой проверки — **details**, **countDetail**, **successDetail** (для любого статуса TRIAL/ADOPT).
+    Результаты и applicability считаются для ветки **branch** (по умолчанию main).
     """
     app_code = body.app.strip()
     if not app_code:
         raise HTTPException(status_code=400, detail="Поле app не может быть пустым")
+    run_branch = _branch_from_query(branch)
 
     ff_app_map = get_fitness_function_applicabilities()
     code_to_id = get_fitness_function_code_to_id()
@@ -1051,6 +1078,7 @@ def run_all(
     if not all_codes:
         return {
             "app": body.app,
+            "branch": run_branch,
             "results": {},
             "skipped": [],
             "message": "Нет доступных проверок: ни .py в каталоге scripts, ни внешнего URL (method) в БД (с учётом test)",
@@ -1091,6 +1119,7 @@ def run_all(
             doc_id=doc_id_param,
             source_type=run_source_type,
             source_id=run_source_id,
+            branch=run_branch,
         )
         results[code] = {
             "success": ok,
@@ -1107,7 +1136,7 @@ def run_all(
             for c in all_codes
             if c not in ran
             and not _applicability_empty(ff_app_map.get(c))
-            and _prerequisites_satisfied(app_code, ff_app_map.get(c), code_to_id)
+            and _prerequisites_satisfied(app_code, ff_app_map.get(c), code_to_id, run_branch)
         ]
         if not batch:
             break
@@ -1120,6 +1149,7 @@ def run_all(
                 doc_id=doc_id_param,
                 source_type=run_source_type,
                 source_id=run_source_id,
+                branch=run_branch,
             )
             results[code] = {
                 "success": ok,
@@ -1142,6 +1172,7 @@ def run_all(
     if not results and skipped:
         return {
             "app": body.app,
+            "branch": run_branch,
             "results": {},
             "skipped": skipped,
             "message": "Ни одна проверка не запущена: не выполнены предусловия applicability или все со статусом TEST",
@@ -1149,6 +1180,7 @@ def run_all(
 
     return {
         "app": body.app,
+        "branch": run_branch,
         "results": results,
         "skipped": skipped,
     }
@@ -1177,6 +1209,7 @@ def get_ff_call_result(call_id: str):
         "callId": row["call_id"],
         "ff_code": row.get("ff_code"),
         "product_code": row.get("product_code"),
+        "branch": row.get("branch"),
         "status": row.get("ff_status") or FF_STATUS_TEST,
     }
     call_state = row.get("status")
@@ -1237,11 +1270,17 @@ def ff_webhook(body: FfWebhookBody):
     "/api/v1/product/{code}/ff",
     responses=_openapi_client_errors(404, 405, 422),
 )
-def post_product_ff_result(code: str, body: ProductFfResultBody):
+def post_product_ff_result(
+    code: str,
+    body: ProductFfResultBody,
+    branch: Optional[str] = Query(default=None, description=_BRANCH_QUERY_DESCRIPTION),
+):
     """
-    Запись результата проверки в product_ff для продукта code (мнемоника из каталога продуктов) и проверки body.ff_code.
+    Запись результата проверки в product_ff для продукта code (мнемоника из каталога продуктов),
+    ветки branch и проверки body.ff_code.
     Скрипты проверок вызывают этот метод вместо прямого доступа к БД.
     """
+    result_branch = _branch_from_query(branch)
     json_details = _json_details_for_db(body.json_details)
     body_source_type, body_source_id = _normalize_run_source(body.source_type, body.source_id)
     status, row_id = save_product_ff_result(
@@ -1253,6 +1292,7 @@ def post_product_ff_result(code: str, body: ProductFfResultBody):
         success_detail=body.success_detail,
         source_type=body_source_type,
         source_id=body_source_id,
+        branch=result_branch,
     )
     if status == "fitness_function_not_found":
         raise HTTPException(
@@ -1266,12 +1306,14 @@ def post_product_ff_result(code: str, body: ProductFfResultBody):
             "saved": False,
             "reason": "test",
             "product_code": code.strip(),
+            "branch": result_branch,
             "ff_code": body.ff_code.strip(),
             "status": ff_st,
         }
     return {
         "id": row_id,
         "product_code": code.strip(),
+        "branch": result_branch,
         "ff_code": body.ff_code.strip(),
         "saved": True,
         "status": ff_st,
@@ -1298,7 +1340,7 @@ def post_product_ff_result(code: str, body: ProductFfResultBody):
 def get_dashboard_fitness_function():
     """
     Агрегированные результаты фитнес-функций для дашборда:
-    справочник опубликованных ФФ, все домены и приложения с актуальными результатами product_ff.
+    справочник опубликованных ФФ, все домены и приложения с актуальными результатами product_ff ветки main.
     Заголовки авторизации не проверяются.
     """
     try:
@@ -1324,9 +1366,10 @@ def get_product_actual_results(
             "иначе основные (без auxiliary_check). TEST не включается."
         ),
     ),
+    branch: Optional[str] = Query(default=None, description=_BRANCH_QUERY_DESCRIPTION),
 ):
     """
-    По коду продукта возвращает актуальные результаты проверок (is_actual == true),
+    По коду продукта и ветке (по умолчанию main) возвращает актуальные результаты проверок (is_actual == true),
     без тестовых (status TEST). По умолчанию — основные (без auxiliary_check);
     при query **auxiliary=true** — только вспомогательные. Пустой список, если записей ещё нет.
     Код продукта в пути сравнивается без учёта регистра.
@@ -1335,14 +1378,16 @@ def get_product_actual_results(
     - countDetail — count_detail,
     - successDetail — success_detail.
     """
+    result_branch = _branch_from_query(branch)
     raw_results = get_actual_results_by_product_code(
         code,
+        branch=result_branch,
         auxiliary_only=auxiliary is True,
     )
 
     results = [_product_ff_row_to_api(r) for r in raw_results]
 
-    return ProductActualResultsBody(product_code=code, results=results)
+    return ProductActualResultsBody(product_code=code, branch=result_branch, results=results)
 
 
 @app.get(
@@ -1350,17 +1395,22 @@ def get_product_actual_results(
     response_model=ProductFfHistoryBody,
     responses=_openapi_client_errors(404, 405),
 )
-def get_product_ff_history_api(code: str, ff_code: str):
+def get_product_ff_history_api(
+    code: str,
+    ff_code: str,
+    branch: Optional[str] = Query(default=None, description=_BRANCH_QUERY_DESCRIPTION),
+):
     """
-    История прохождений одной проверки по продукту: все записи product_ff для пары
-    (код продукта, код проверки), от самой свежей даты к самой старой.
+    История прохождений одной проверки по продукту: все записи product_ff для
+    (код продукта, ветка — по умолчанию main, код проверки), от самой свежей даты к самой старой.
 
     В каждой записи — полные данные прохождения (is_check, details, счётчики, source_type, source_id),
     а также **is_actual** (актуальная запись на момент запроса).
     Код продукта в path сравнивается без учёта регистра.
     Если проверка с ff_code не найдена — 404; если истории нет — history: [].
     """
-    raw_history = get_product_ff_history(code, ff_code)
+    history_branch = _branch_from_query(branch)
+    raw_history = get_product_ff_history(code, ff_code, history_branch)
     if raw_history is None:
         raise HTTPException(
             status_code=404,
@@ -1370,6 +1420,7 @@ def get_product_ff_history_api(code: str, ff_code: str):
     history = [_product_ff_row_to_api(r, include_is_actual=True) for r in raw_history]
     return ProductFfHistoryBody(
         product_code=code.strip(),
+        branch=history_branch,
         ff_code=ff_code.strip(),
         history=history,
     )

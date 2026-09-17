@@ -31,7 +31,8 @@
 ```json
 {
   "callId": "<uuid>",
-  "productCode": "<мнемоника из поля app в run>"
+  "productCode": "<мнемоника из поля app в run>",
+  "branch": "<ветка продукта из query branch в run; по умолчанию main>"
 }
 ```
 

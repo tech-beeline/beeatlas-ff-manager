@@ -36,11 +36,12 @@
 ```json
 {
   "callId": "<uuid — идентификатор вызова>",
-  "productCode": "<мнемоника продукта из тела run: поле app>"
+  "productCode": "<мнемоника продукта из тела run: поле app>",
+  "branch": "<ветка продукта из query branch в run; по умолчанию main>"
 }
 ```
 
-Имена полей в исходящем теле: **`callId`**, **`productCode`** (camelCase).
+Имена полей в исходящем теле: **`callId`**, **`productCode`**, **`branch`** (camelCase). Результат webhook записывается в ту ветку, с которой был запущен вызов.
 
 ### Параметр `docId`
 
