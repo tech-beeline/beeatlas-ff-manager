@@ -6,6 +6,7 @@
 
 Переменные окружения:
 - FF_API_BASE_URL — базовый URL сервиса (по умолчанию http://127.0.0.1:8000).
+- FF_BRANCH — ветка продукта, для которой запущена проверка (по умолчанию main).
 - Structurizr HMAC: FF_STRUCTURIZR_HTTP_BASE_URL, FF_STRUCTURIZR_API_KEY, FF_STRUCTURIZR_API_SECRET
   (задаётся раннером при POST /api/v1/run и /api/v1/run-all; в скриптах вызывайте structurizr_http_client()).
 """
@@ -97,6 +98,7 @@ def persist_execute_result(
     details: list[dict[str, Any]],
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
+    branch: Optional[str] = None,
 ) -> None:
     """
     Сохраняет результат проверки: count_detail = len(details), success_detail — число элементов с check=true.
@@ -117,6 +119,7 @@ def persist_execute_result(
         json_details=json_details,
         source_type=source_type,
         source_id=source_id,
+        branch=branch,
     )
 
 
@@ -133,6 +136,10 @@ def structurizr_http_client() -> "StructurizrHmacClient":
     return StructurizrHmacClient.from_env()
 
 
+def current_branch(branch: Optional[str] = None) -> str:
+    return (branch or os.environ.get("FF_BRANCH") or "main").strip()
+
+
 def run_check(
     app_code: str,
     script_code: str,
@@ -142,6 +149,7 @@ def run_check(
     json_details: Optional[str] = None,
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
+    branch: Optional[str] = None,
 ) -> None:
     """
     Отправляет результат проверки на API: создаётся актуальная запись product_ff.
@@ -155,7 +163,7 @@ def run_check(
     base = os.environ.get("FF_API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
     alias = app_code.strip()
     path = urllib.parse.quote(alias, safe="")
-    url = f"{base}/api/v1/product/{path}/ff"
+    url = f"{base}/api/v1/product/{path}/ff?" + urllib.parse.urlencode({"branch": current_branch(branch)})
 
     if source_type is None:
         source_type = os.environ.get("FF_SOURCE_TYPE") or None

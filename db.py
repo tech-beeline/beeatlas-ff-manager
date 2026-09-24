@@ -18,6 +18,7 @@ from ff_status import (
     should_clear_ff_run_data,
     skips_product_ff_persistence,
 )
+from branch import DEFAULT_BRANCH
 from run_result import resolve_detail_fields_for_storage
 
 SCHEMA = "ff"
@@ -72,18 +73,22 @@ def get_cursor():
         conn.close()
 
 
-def get_latest_check_result(product_code: str, ff_code: str) -> Optional[bool]:
+def get_latest_check_result(product_code: str, ff_code: str, branch: str = DEFAULT_BRANCH) -> Optional[bool]:
     """
     Возвращает is_check последней актуальной записи product_ff для пары (код продукта, фитнес-функция по code).
     Если записи нет — None.
     """
-    payload = get_latest_check_result_payload(product_code, ff_code)
+    payload = get_latest_check_result_payload(product_code, ff_code, branch)
     if payload is None:
         return None
     return payload.get("is_check")
 
 
-def get_latest_check_result_payload(product_code: str, ff_code: str) -> Optional[dict]:
+def get_latest_check_result_payload(
+    product_code: str,
+    ff_code: str,
+    branch: str = DEFAULT_BRANCH,
+) -> Optional[dict]:
     """Последняя актуальная запись product_ff для ответа run (is_check, json_details, счётчики)."""
     with get_cursor() as cur:
         cur.execute(
@@ -91,11 +96,12 @@ def get_latest_check_result_payload(product_code: str, ff_code: str) -> Optional
             SELECT pf.is_check, pf.json_details, pf.count_detail, pf.success_detail
             FROM {SCHEMA}.product_ff pf
             JOIN {SCHEMA}.fitness_function ff ON ff.id = pf.ff_id
-            WHERE LOWER(pf.product_code) = LOWER(%s) AND ff.code = %s AND pf.is_actual = true
+            WHERE LOWER(pf.product_code) = LOWER(%s) AND LOWER(pf.branch) = LOWER(%s)
+              AND ff.code = %s AND pf.is_actual = true
             ORDER BY pf.create_date DESC
             LIMIT 1
             """,
-            (product_code.strip(), ff_code.strip()),
+            (product_code.strip(), branch, ff_code.strip()),
         )
         row = cur.fetchone()
     return dict(row) if row is not None else None
@@ -139,10 +145,11 @@ def save_product_ff_result(
     success_detail: Optional[int] = None,
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
+    branch: str = DEFAULT_BRANCH,
 ) -> tuple[str, Optional[int]]:
     """
-    Добавляет актуальную запись product_ff для продукта (внешний код) и проверки (ff code).
-    Предыдущие актуальные записи для этой пары помечаются is_actual = false.
+    Добавляет актуальную запись product_ff для продукта (внешний код), ветки и проверки (ff code).
+    Предыдущие актуальные записи для этой тройки помечаются is_actual = false.
     Возвращает ("ok", id), ("fitness_function_not_found", None) или ("test_mode", None) для status=TEST.
     """
     code_key = product_code.strip()
@@ -165,45 +172,74 @@ def save_product_ff_result(
             success_detail=success_detail,
         )
 
-        cur.execute(
-            f"""
-            UPDATE {SCHEMA}.product_ff
-            SET is_actual = false
-            WHERE LOWER(product_code) = LOWER(%s) AND ff_id = %s AND is_actual = true
-            """,
-            (code_key, ff_id),
+        new_id = _insert_actual_product_ff(
+            cur,
+            product_code=code_key,
+            branch=branch,
+            ff_id=ff_id,
+            is_check=is_check,
+            json_details=json_details,
+            count_detail=count_detail,
+            success_detail=success_detail,
+            source_type=source_type,
+            source_id=source_id,
         )
-        cur.execute(
-            f"""
-            INSERT INTO {SCHEMA}.product_ff (
-                product_code,
-                ff_id,
-                is_check,
-                is_actual,
-                json_details,
-                count_detail,
-                success_detail,
-                source_type,
-                source_id,
-                create_date
-            )
-            VALUES (%s, %s, %s, true, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                code_key,
-                ff_id,
-                is_check,
-                json_details,
-                count_detail,
-                success_detail,
-                source_type,
-                source_id,
-                _server_now(),
-            ),
+        return ("ok", new_id)
+
+
+def _insert_actual_product_ff(
+    cur,
+    *,
+    product_code: str,
+    branch: str,
+    ff_id: int,
+    is_check: bool,
+    json_details: Optional[str],
+    count_detail: Optional[int],
+    success_detail: Optional[int],
+    source_type: Optional[str],
+    source_id: Optional[str],
+) -> int:
+    cur.execute(
+        f"""
+        UPDATE {SCHEMA}.product_ff
+        SET is_actual = false
+        WHERE LOWER(product_code) = LOWER(%s) AND LOWER(branch) = LOWER(%s) AND ff_id = %s AND is_actual = true
+        """,
+        (product_code, branch, ff_id),
+    )
+    cur.execute(
+        f"""
+        INSERT INTO {SCHEMA}.product_ff (
+            product_code,
+            branch,
+            ff_id,
+            is_check,
+            is_actual,
+            json_details,
+            count_detail,
+            success_detail,
+            source_type,
+            source_id,
+            create_date
         )
-        new_row = cur.fetchone()
-        return ("ok", new_row["id"])
+        VALUES (%s, %s, %s, %s, true, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            product_code,
+            branch,
+            ff_id,
+            is_check,
+            json_details,
+            count_detail,
+            success_detail,
+            source_type,
+            source_id,
+            _server_now(),
+        ),
+    )
+    return cur.fetchone()["id"]
 
 
 def set_fitness_function_status(code: str, new_status: str) -> Optional[dict]:
@@ -273,18 +309,19 @@ def insert_outside_ff_call(
     *,
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
+    branch: str = DEFAULT_BRANCH,
 ) -> int:
     """Статус начального вызова — 'call'. Возвращает id строки outside_ff."""
     with get_cursor() as cur:
         cur.execute(
             f"""
             INSERT INTO {SCHEMA}.outside_ff (
-                ff_id, product_code, call_id, status, source_type, source_id
+                ff_id, product_code, branch, call_id, status, source_type, source_id
             )
-            VALUES (%s, %s, %s, 'call', %s, %s)
+            VALUES (%s, %s, %s, %s, 'call', %s, %s)
             RETURNING id
             """,
-            (ff_id, product_code.strip(), call_id.strip(), source_type, source_id),
+            (ff_id, product_code.strip(), branch, call_id.strip(), source_type, source_id),
         )
         return cur.fetchone()["id"]
 
@@ -321,7 +358,7 @@ def process_ff_webhook(
     with get_cursor() as cur:
         cur.execute(
             f"""
-            SELECT id, ff_id, product_code, status, source_type, source_id
+            SELECT id, ff_id, product_code, branch, status, source_type, source_id
             FROM {SCHEMA}.outside_ff
             WHERE call_id = %s
             FOR UPDATE
@@ -354,41 +391,17 @@ def process_ff_webhook(
         )
 
         if not is_test_mode:
-            cur.execute(
-                f"""
-                UPDATE {SCHEMA}.product_ff
-                SET is_actual = false
-                WHERE LOWER(product_code) = LOWER(%s) AND ff_id = %s AND is_actual = true
-                """,
-                (pc, ff_id),
-            )
-            cur.execute(
-                f"""
-                INSERT INTO {SCHEMA}.product_ff (
-                    product_code,
-                    ff_id,
-                    is_check,
-                    is_actual,
-                    json_details,
-                    count_detail,
-                    success_detail,
-                    source_type,
-                    source_id,
-                    create_date
-                )
-                VALUES (%s, %s, %s, true, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    pc,
-                    ff_id,
-                    is_check,
-                    json_details,
-                    count_detail,
-                    success_detail,
-                    source_type,
-                    source_id,
-                    _server_now(),
-                ),
+            _insert_actual_product_ff(
+                cur,
+                product_code=pc,
+                branch=row.get("branch") or DEFAULT_BRANCH,
+                ff_id=ff_id,
+                is_check=is_check,
+                json_details=json_details,
+                count_detail=count_detail,
+                success_detail=success_detail,
+                source_type=source_type,
+                source_id=source_id,
             )
         if is_test_mode:
             cur.execute(
@@ -421,7 +434,7 @@ def get_outside_ff_call(call_id: str) -> Optional[dict]:
     with get_cursor() as cur:
         cur.execute(
             f"""
-            SELECT o.id, o.ff_id, o.product_code, o.call_id, o.status,
+            SELECT o.id, o.ff_id, o.product_code, o.branch, o.call_id, o.status,
                    o.is_check, o.json_details, o.count_detail, o.success_detail,
                    ff.code AS ff_code, ff.status AS ff_status
             FROM {SCHEMA}.outside_ff o
@@ -439,20 +452,21 @@ def get_outside_ff_call(call_id: str) -> Optional[dict]:
         return d
 
 
-def product_has_actual_ff_pass(product_code: str, ff_id: int) -> bool:
+def product_has_actual_ff_pass(product_code: str, ff_id: int, branch: str = DEFAULT_BRANCH) -> bool:
     """
-    True, если для пары (product_code, ff_id) есть актуальная запись product_ff с is_check = true.
-    Сравнение product_code регистронезависимое.
+    True, если для (product_code, branch, ff_id) есть актуальная запись product_ff с is_check = true.
+    Сравнение product_code и branch регистронезависимое.
     """
     with get_cursor() as cur:
         cur.execute(
             f"""
             SELECT 1
             FROM {SCHEMA}.product_ff
-            WHERE LOWER(product_code) = LOWER(%s) AND ff_id = %s AND is_actual = true AND is_check = true
+            WHERE LOWER(product_code) = LOWER(%s) AND LOWER(branch) = LOWER(%s)
+              AND ff_id = %s AND is_actual = true AND is_check = true
             LIMIT 1
             """,
-            (product_code.strip(), ff_id),
+            (product_code.strip(), branch, ff_id),
         )
         return cur.fetchone() is not None
 
@@ -635,7 +649,7 @@ def get_published_fitness_functions() -> list[dict]:
 
 def get_actual_results_by_product_codes(product_codes: list[str]) -> list[dict]:
     """
-    Актуальные product_ff для нескольких продуктов одним запросом.
+    Актуальные product_ff ветки main для нескольких продуктов одним запросом.
     Те же фильтры, что у get_actual_results_by_product_code (основные проверки, TRIAL/ADOPT).
     Сравнение product_code без учёта регистра.
     """
@@ -649,6 +663,7 @@ def get_actual_results_by_product_codes(product_codes: list[str]) -> list[dict]:
             SELECT
                 pf.id,
                 pf.product_code,
+                pf.branch,
                 pf.ff_id,
                 pf.is_check,
                 pf.create_date,
@@ -664,11 +679,12 @@ def get_actual_results_by_product_codes(product_codes: list[str]) -> list[dict]:
             JOIN {SCHEMA}.fitness_function ff ON ff.id = pf.ff_id
             WHERE pf.is_actual = true
               AND LOWER(pf.product_code) = ANY(%s)
+              AND LOWER(pf.branch) = %s
               AND (ff.auxiliary_check IS NOT TRUE)
               AND (ff.status IN (%s, %s))
             ORDER BY pf.product_code, pf.create_date
             """,
-            (lowered, FF_STATUS_TRIAL, FF_STATUS_ADOPT),
+            (lowered, DEFAULT_BRANCH, FF_STATUS_TRIAL, FF_STATUS_ADOPT),
         )
         rows = cur.fetchall()
     out = []
@@ -682,10 +698,11 @@ def get_actual_results_by_product_codes(product_codes: list[str]) -> list[dict]:
 def get_actual_results_by_product_code(
     product_code: str,
     *,
+    branch: str = DEFAULT_BRANCH,
     auxiliary_only: bool = False,
 ) -> list[dict]:
     """
-    По коду продукта (внешняя мнемоника) возвращает актуальные записи product_ff:
+    По коду продукта (внешняя мнемоника) и ветке возвращает актуальные записи product_ff:
     - auxiliary_only=False (по умолчанию): основные проверки (auxiliary_check не true);
     - auxiliary_only=True: только вспомогательные (auxiliary_check = true).
     В обоих случаях не включается status = TEST (только TRIAL и ADOPT).
@@ -706,6 +723,7 @@ def get_actual_results_by_product_code(
             SELECT
                 pf.id,
                 pf.product_code,
+                pf.branch,
                 pf.ff_id,
                 pf.is_check,
                 pf.create_date,
@@ -719,12 +737,12 @@ def get_actual_results_by_product_code(
                 ff.status AS ff_status
             FROM {SCHEMA}.product_ff pf
             JOIN {SCHEMA}.fitness_function ff ON ff.id = pf.ff_id
-            WHERE LOWER(pf.product_code) = LOWER(%s) AND pf.is_actual = true
+            WHERE LOWER(pf.product_code) = LOWER(%s) AND LOWER(pf.branch) = LOWER(%s) AND pf.is_actual = true
               AND {aux_clause}
               AND (ff.status IN (%s, %s))
             ORDER BY pf.create_date
             """,
-            (code, FF_STATUS_TRIAL, FF_STATUS_ADOPT),
+            (code, branch, FF_STATUS_TRIAL, FF_STATUS_ADOPT),
         )
         rows = cur.fetchall()
     out = []
@@ -735,9 +753,13 @@ def get_actual_results_by_product_code(
     return out
 
 
-def get_product_ff_history(product_code: str, ff_code: str) -> Optional[list[dict]]:
+def get_product_ff_history(
+    product_code: str,
+    ff_code: str,
+    branch: str = DEFAULT_BRANCH,
+) -> Optional[list[dict]]:
     """
-    История всех записей product_ff для пары (код продукта, код проверки), от новых к старым.
+    История всех записей product_ff для (код продукта, ветка, код проверки), от новых к старым.
     None — если проверка с ff_code не найдена в fitness_function.
     Поля: id, product_code, ff_id, ff_code, ff_description, is_check, is_actual, create_date,
     json_details, count_detail, success_detail, source_type, source_id, ff_status (текущий статус проверки).
@@ -756,6 +778,7 @@ def get_product_ff_history(product_code: str, ff_code: str) -> Optional[list[dic
             SELECT
                 pf.id,
                 pf.product_code,
+                pf.branch,
                 pf.ff_id,
                 pf.is_check,
                 pf.is_actual,
@@ -770,10 +793,10 @@ def get_product_ff_history(product_code: str, ff_code: str) -> Optional[list[dic
                 ff.status AS ff_status
             FROM {SCHEMA}.product_ff pf
             JOIN {SCHEMA}.fitness_function ff ON ff.id = pf.ff_id
-            WHERE LOWER(pf.product_code) = LOWER(%s) AND ff.code = %s
+            WHERE LOWER(pf.product_code) = LOWER(%s) AND LOWER(pf.branch) = LOWER(%s) AND ff.code = %s
             ORDER BY pf.create_date DESC, pf.id DESC
             """,
-            (pc, fc),
+            (pc, branch, fc),
         )
         rows = cur.fetchall()
     out = []
@@ -825,13 +848,14 @@ def get_products_passed_ff_codes(unique_ff_codes: list[str]) -> list[str]:
             JOIN {SCHEMA}.fitness_function ff ON ff.id = pf.ff_id
             WHERE pf.is_actual = true
               AND pf.is_check = true
+              AND LOWER(pf.branch) = %s
               AND ff.status IN (%s, %s)
               AND LOWER(BTRIM(ff.code)) = ANY(%s)
             GROUP BY pf.product_code
             HAVING COUNT(DISTINCT LOWER(BTRIM(ff.code))) = %s
             ORDER BY LOWER(pf.product_code)
             """,
-            (FF_STATUS_TRIAL, FF_STATUS_ADOPT, lower_codes, len(lower_codes)),
+            (DEFAULT_BRANCH, FF_STATUS_TRIAL, FF_STATUS_ADOPT, lower_codes, len(lower_codes)),
         )
         rows = cur.fetchall()
     return [r["product_code"] for r in rows]
@@ -945,7 +969,7 @@ def init_schema():
             ALTER TABLE {SCHEMA}.fitness_function
             ADD COLUMN IF NOT EXISTS method_synchronous BOOLEAN NOT NULL DEFAULT false;
         """)
-        # Уникальность code нужна для внешнего FK из bi_dashboards.ff (см. init_bi_dashboards_schema).
+        # Уникальность code: инвариант справочника ФФ, на нём же строится поиск по коду.
         cur.execute(f"""
             DO $$
             BEGIN
@@ -987,6 +1011,19 @@ def init_schema():
         cur.execute(f"""
             ALTER TABLE {SCHEMA}.outside_ff
             ADD COLUMN IF NOT EXISTS source_id TEXT;
+        """)
+        cur.execute(f"""
+            ALTER TABLE {SCHEMA}.product_ff
+            ADD COLUMN IF NOT EXISTS branch TEXT NOT NULL DEFAULT '{DEFAULT_BRANCH}';
+        """)
+        cur.execute(f"""
+            ALTER TABLE {SCHEMA}.outside_ff
+            ADD COLUMN IF NOT EXISTS branch TEXT NOT NULL DEFAULT '{DEFAULT_BRANCH}';
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_product_ff_actual_product_branch
+                ON {SCHEMA}.product_ff (LOWER(product_code), LOWER(branch), ff_id)
+                WHERE is_actual = true;
         """)
         cur.execute(
             f"""
@@ -1102,13 +1139,29 @@ def init_bi_dashboards_schema():
     """
     Схема bi_dashboards: витрина результатов ФФ для внешних потребителей (Qlik Sense и др.).
     Реплицируется из ff.product_ff триггером trg_product_ff_replicate (AFTER INSERT).
-    Требует UNIQUE на product.product(alias) и ff.fitness_function(code) — см. init_schema()
-    и fdm-products миграцию V0043 (без них FK ниже не создастся).
+    FK на product.product(alias) и ff.fitness_function(code) намеренно не создаются:
+    витрина не должна зависеть от внешних схем (см. корректирующую миграцию в начале).
     """
     conn = get_connection()
     conn.autocommit = True
     cur = conn.cursor()
     try:
+        # Корректирующая миграция (SFDM-4109): витрина не должна зависеть от внешних схем
+        # (product.product, ff.fitness_function). FK блокировали удаление продуктов и ФФ
+        # и требовали раскатанной V0043 в fdm-products. Целостность обеспечивает триггер
+        # fn_replicate_product_ff, который пишет только существующие product_code/ff_code.
+        # Идёт первой в функции: на уже развёрнутых окружениях таблица существует, и снятие
+        # FK не должно зависеть от успеха остальных DDL ниже (autocommit — каждый ALTER
+        # фиксируется отдельно).
+        cur.execute(f"""
+            ALTER TABLE IF EXISTS {BI_DASHBOARDS_SCHEMA}.ff
+                DROP CONSTRAINT IF EXISTS fk_bi_dashboards_ff_product_alias;
+        """)
+        cur.execute(f"""
+            ALTER TABLE IF EXISTS {BI_DASHBOARDS_SCHEMA}.ff
+                DROP CONSTRAINT IF EXISTS fk_bi_dashboards_ff_code;
+        """)
+
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {BI_DASHBOARDS_SCHEMA};")
         cur.execute(f"""
             COMMENT ON SCHEMA {BI_DASHBOARDS_SCHEMA} IS
@@ -1134,12 +1187,6 @@ def init_bi_dashboards_schema():
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 CONSTRAINT pk_bi_dashboards_ff PRIMARY KEY (id),
-                CONSTRAINT fk_bi_dashboards_ff_product_alias
-                    FOREIGN KEY (product_alias) REFERENCES product.product (alias)
-                    ON DELETE CASCADE,
-                CONSTRAINT fk_bi_dashboards_ff_code
-                    FOREIGN KEY (ff_code) REFERENCES {SCHEMA}.fitness_function (code)
-                    ON DELETE SET NULL,
                 CONSTRAINT chk_bi_dashboards_ff_counts
                     CHECK (success_detail IS NULL OR count_detail IS NULL OR success_detail <= count_detail)
             );
@@ -1232,6 +1279,10 @@ def init_bi_dashboards_schema():
             DECLARE
               v_ff_code VARCHAR(100);
             BEGIN
+              IF LOWER(NEW.branch) <> '{DEFAULT_BRANCH}' THEN
+                RETURN NEW;
+              END IF;
+
               -- 1. Получить код фитнес-функции по ff_id
               SELECT code
                 INTO v_ff_code

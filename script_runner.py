@@ -20,6 +20,7 @@ from run_result import (
 
 CheckResultPayload = Optional[dict[str, Any]]
 
+from branch import DEFAULT_BRANCH
 from config import settings
 from db import (
     add_fitness_function,
@@ -289,6 +290,7 @@ def run_script(
     is_test_mode: bool = False,
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
+    branch: str = DEFAULT_BRANCH,
 ) -> Tuple[bool, str, CheckResultPayload]:
     """
     Запуск одного скрипта проверки для приложения.
@@ -311,6 +313,7 @@ def run_script(
     env["FF_DB_PASSWORD"] = settings.db_password
     env["FF_DB_NAME"] = settings.db_name
     env["FF_API_BASE_URL"] = settings.api_base_url
+    env["FF_BRANCH"] = branch
     if source_type:
         env["FF_SOURCE_TYPE"] = source_type
     if source_id:
@@ -331,6 +334,7 @@ def run_script(
             is_test_mode=is_test_mode,
             source_type=source_type,
             source_id=source_id,
+            branch=branch,
         )
         if done:
             if not ok:
@@ -358,7 +362,7 @@ def run_script(
                 ),
                 None,
             )
-        stored = get_latest_check_result_payload(app_mnemonic, code)
+        stored = get_latest_check_result_payload(app_mnemonic, code, branch)
         if stored is None:
             return (
                 False,
@@ -391,6 +395,7 @@ def _run_script_module(
     is_test_mode: bool = False,
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
+    branch: str = DEFAULT_BRANCH,
 ) -> Tuple[bool, str, bool, CheckResultPayload]:
     """
     Пытается выполнить скрипт как модуль через функцию execute(app_code).
@@ -440,6 +445,7 @@ def _run_script_module(
                 details=result["details"],
                 source_type=source_type,
                 source_id=source_id,
+                branch=branch,
             )
         return True, capture.getvalue().strip(), True, check_payload
     except Exception as e:

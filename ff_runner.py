@@ -7,6 +7,7 @@ import urllib.request
 import uuid
 from typing import Any, Optional, Tuple
 
+from branch import DEFAULT_BRANCH
 from config import settings
 from db import (
     delete_outside_ff_by_call_id,
@@ -115,9 +116,10 @@ def run_ff_check(
     doc_id: Optional[str] = None,
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
+    branch: str = DEFAULT_BRANCH,
 ) -> Tuple[bool, str, CheckResultPayload]:
     """
-    Если в БД у фитнес-функции задан непустой method (URL) — POST { callId, productCode }, запись в outside_ff.
+    Если в БД у фитнес-функции задан непустой method (URL) — POST { callId, productCode, branch }, запись в outside_ff.
     method_synchronous: ответ обрабатывается сразу (как webhook) или ожидается POST /api/v1/ff/webhook.
     doc_id: при передаче в run добавляется query-параметр docId к URL method.
     Иначе — запуск скрипта .py как раньше.
@@ -141,6 +143,7 @@ def run_ff_check(
                 is_test_mode=is_test_mode,
                 source_type=source_type,
                 source_id=source_id,
+                branch=branch,
             )
 
     return run_script(
@@ -151,6 +154,7 @@ def run_ff_check(
         is_test_mode=is_test_mode,
         source_type=source_type,
         source_id=source_id,
+        branch=branch,
     )
 
 
@@ -164,6 +168,7 @@ def _invoke_external_post(
     is_test_mode: bool,
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
+    branch: str = DEFAULT_BRANCH,
 ) -> Tuple[bool, str, CheckResultPayload]:
     call_id = str(uuid.uuid4())
     product_code = app_mnemonic.strip()
@@ -173,12 +178,13 @@ def _invoke_external_post(
         call_id=call_id,
         source_type=source_type,
         source_id=source_id,
+        branch=branch,
     )
     target_url = _url_with_doc_id_query(url, doc_id)
     try:
         status, text = _post_json(
             target_url,
-            {"callId": call_id, "productCode": product_code},
+            {"callId": call_id, "productCode": product_code, "branch": branch},
             settings.external_ff_timeout_seconds,
         )
         if not (200 <= status < 300):
