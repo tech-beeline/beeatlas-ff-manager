@@ -4,7 +4,7 @@ FROM ${RUN_IMAGE}
 # FROM python:3.12-slim-bookworm
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates python3 pip python3-dev libpq5 && \
+    apt-get install -y --no-install-recommends ca-certificates python3 pip python3-dev libpq5 libpq-dev gcc && \
     rm -rf /var/cache/apt/archives /var/lib/apt/lists/* && \
     groupadd --gid 1000 app && \
     useradd --uid 1000 --gid app --no-create-home --shell /usr/sbin/nologin app
