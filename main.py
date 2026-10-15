@@ -12,7 +12,7 @@ from typing import Any, Optional, Union
 
 log = logging.getLogger(__name__)
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exception_handlers import (
     http_exception_handler as default_http_exception_handler,
@@ -107,7 +107,15 @@ def _request_validation_error_message_ru(exc: RequestValidationError) -> str:
             fragments.append(f"Поле «{field}» должно содержать не менее {min_len} символов.")
         elif et in ("string_type", "int_type", "bool_type", "float_type"):
             fragments.append(f"Поле «{field}» имеет неверный тип.")
-        elif et == "list_type":
+        elif et == "dict_type":
+            if name_bits:
+                fragments.append(f"Поле «{field}» должно быть объектом JSON.")
+            else:
+                fragments.append(
+                    "Тело запроса должно быть объектом JSON (workspace) и передаваться "
+                    "с заголовком Content-Type: application/json."
+                )
+        elif et in ("list_type", "tuple_type", "set_type"):
             fragments.append(f"Поле «{field}» должно быть массивом.")
         elif et == "model_attributes_type":
             fragments.append("Тело запроса должно быть объектом JSON, а не массивом или примитивом.")
@@ -1196,6 +1204,16 @@ def run_all(
 # Ограничение размера тела workspace.json (документ Structurizr — единицы МБ)
 MAX_WORKSPACE_BODY_BYTES = 16 * 1024 * 1024
 
+# Пример тела для Swagger UI (кнопка Try it out): минимальный валидный workspace.
+_WORKSPACE_BODY_EXAMPLE = {
+    "id": 0,
+    "name": "my-product",
+    "description": "Пример workspace",
+    "model": {"people": [], "softwareSystems": [], "properties": {}},
+    "views": {"configuration": {"styles": {}}, "systemLandscapeViews": []},
+    "documentation": {"decisions": []},
+}
+
 
 def _run_all_workspace_impl(
     app_code: str,
@@ -1335,10 +1353,23 @@ async def run_all_workspace(
     request: Request,
     app: str = Query(..., description="Мнемоника приложения (alias продукта)"),
     branch: Optional[str] = Query(default=None, description=_BRANCH_QUERY_DESCRIPTION),
+    workspace: dict[str, Any] = Body(
+        ...,
+        description=(
+            "JSON-документ workspace (Structurizr) целиком — то же содержимое, что отдаёт "
+            "Structurizr по пути `/json`. Обёртка не используется: тело и есть workspace."
+        ),
+        openapi_examples={
+            "Пример workspace": {
+                "summary": "Минимальный workspace Structurizr",
+                "value": _WORKSPACE_BODY_EXAMPLE,
+            }
+        },
+    ),
 ):
     """
-    Расчёт всех проверок для продукта по **workspace.json из тела запроса**, без сохранения результатов.
-    Тело — сам JSON-документ workspace (Structurizr); мнемоника продукта — в query **app**.
+    Расчёт всех проверок для продукта по **workspace.json в теле запроса**, без сохранения результатов.
+    Тело — сам JSON-документ workspace (Structurizr); мнемоника продукта — в query **app**, ветка — в **branch**.
     Сервис сам создаёт документ в Documents API (`POST /api/v2/documents/workspace/json`) и передаёт
     его **docId** синхронным внешним проверкам, а скриптам — workspace в **data**.
     Запускаются проверки со статусом **TRIAL** / **ADOPT** (TEST исключаются).
@@ -1365,24 +1396,11 @@ async def run_all_workspace(
     ):
         raise HTTPException(status_code=413, detail=too_large)
 
+    # Тело уже разобрано FastAPI (параметр workspace); сырые байты нужны, чтобы отдать
+    # в document-service ровно то, что прислал клиент.
     raw_body = await request.body()
     if len(raw_body) > MAX_WORKSPACE_BODY_BYTES:
         raise HTTPException(status_code=413, detail=too_large)
-    if not raw_body.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Тело запроса не может быть пустым: ожидается JSON-документ workspace",
-        )
-    try:
-        workspace = json.loads(raw_body)
-    except json.JSONDecodeError as e:
-        raise HTTPException(
-            status_code=400, detail=f"Тело запроса не является корректным JSON: {e}"
-        ) from e
-    if not isinstance(workspace, dict):
-        raise HTTPException(
-            status_code=400, detail="Тело запроса должно быть JSON-объектом workspace"
-        )
 
     return await run_in_threadpool(
         _run_all_workspace_impl, app_code, run_branch, raw_body, workspace

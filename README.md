@@ -67,6 +67,11 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 `POST /api/v1/run-all-workspace` — «сухой» расчёт без сохранения: тело запроса — сам `workspace.json` (JSON-документ workspace), сервис создаёт документ в document-service (`POST /api/v2/documents/workspace/json?fileName=workspace.json&isPublic=true`), его `docId` уходит query-параметром синхронным внешним проверкам, а скриптам workspace передаётся в `data`. Запускаются только **TRIAL**/**ADOPT**; `applicability` проверяется по актуальным записям `product_ff` и по успешным результатам этого же вызова; асинхронные внешние проверки (`method_synchronous=false`) пропускаются. В `product_ff` и `outside_ff` ничего не записывается. Ограничение: скрипт без `execute()`, записывающий результат сам через `run_check()`, в этом режиме не запускается.
 
+```bash
+curl -X POST 'http://localhost:8000/api/v1/run-all-workspace?app=<alias>&branch=main' \
+  -H 'Content-Type: application/json' --data-binary @workspace.json
+```
+
 ### Ошибки клиента (4xx)
 
 Для всех маршрутов под `/api/v1/`, **кроме** корня `GET /api/v1/`, ответы с кодами 400–499 отдаются в виде JSON с **единственным** полем:
