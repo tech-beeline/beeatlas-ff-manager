@@ -12,7 +12,7 @@ from typing import Any, Optional, Union
 
 log = logging.getLogger(__name__)
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exception_handlers import (
     http_exception_handler as default_http_exception_handler,
@@ -21,6 +21,7 @@ from fastapi.exception_handlers import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.concurrency import run_in_threadpool
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from db import (
@@ -47,12 +48,13 @@ from db import (
     get_products_passed_ff_codes,
 )
 from branch import normalize_branch_name
-from ff_runner import run_ff_check
+from ff_runner import run_ff_check, run_ff_check_no_persist
 from ff_status import FF_STATUS_ADOPT, FF_STATUS_TEST, normalize_ff_status, skips_applicability_check
 from run_result import check_result_from_outside_ff_row
 from config import settings
 from structurizr_hmac import CredentialsFetchError, fetch_structurizr_credentials
 from product_api import ProductApiError, fetch_domain_products
+from document_api import DocumentApiError, upload_workspace_json
 from script_runner import (
     ensure_scripts_dir,
     list_scripts,
@@ -105,7 +107,15 @@ def _request_validation_error_message_ru(exc: RequestValidationError) -> str:
             fragments.append(f"Поле «{field}» должно содержать не менее {min_len} символов.")
         elif et in ("string_type", "int_type", "bool_type", "float_type"):
             fragments.append(f"Поле «{field}» имеет неверный тип.")
-        elif et == "list_type":
+        elif et == "dict_type":
+            if name_bits:
+                fragments.append(f"Поле «{field}» должно быть объектом JSON.")
+            else:
+                fragments.append(
+                    "Тело запроса должно быть объектом JSON (workspace) и передаваться "
+                    "с заголовком Content-Type: application/json."
+                )
+        elif et in ("list_type", "tuple_type", "set_type"):
             fragments.append(f"Поле «{field}» должно быть массивом.")
         elif et == "model_attributes_type":
             fragments.append("Тело запроса должно быть объектом JSON, а не массивом или примитивом.")
@@ -165,6 +175,7 @@ def _openapi_client_errors(*status_codes: int) -> dict[int, dict[str, Any]]:
         405: "Для этого URL указан неверный HTTP-метод.",
         409: "Конфликт с текущим состоянием (например, проверка с таким кодом уже существует).",
         415: "Неверный Content-Type (ожидается multipart/form-data).",
+        413: "Тело запроса слишком большое (для workspace.json действует ограничение).",
         422: "Ошибка валидации тела запроса или параметров (формат JSON, обязательные поля и т.д.).",
     }
     return {
@@ -897,10 +908,12 @@ def _prerequisites_satisfied(
     applicability: Optional[str],
     code_to_id: dict[str, int],
     branch: str,
+    extra_passed: Optional[set[str]] = None,
 ) -> bool:
     """
     Проверка по product_ff: для каждого кода в applicability (через запятую)
     должна быть актуальная запись ветки branch с is_check = true.
+    extra_passed — коды, успешно выполненные в текущем вызове (режим без сохранения).
     Пустая applicability — всегда True.
     """
     if _applicability_empty(applicability):
@@ -909,6 +922,8 @@ def _prerequisites_satisfied(
     for raw in applicability.split(","):
         prereq_code = raw.strip()
         if not prereq_code:
+            continue
+        if extra_passed and prereq_code in extra_passed:
             continue
         ff_id = code_to_id.get(prereq_code)
         if ff_id is None:
@@ -1184,6 +1199,212 @@ def run_all(
         "results": results,
         "skipped": skipped,
     }
+
+
+# Ограничение размера тела workspace.json (документ Structurizr — единицы МБ)
+MAX_WORKSPACE_BODY_BYTES = 16 * 1024 * 1024
+
+# Пример тела для Swagger UI (кнопка Try it out): минимальный валидный workspace.
+_WORKSPACE_BODY_EXAMPLE = {
+    "id": 0,
+    "name": "my-product",
+    "description": "Пример workspace",
+    "model": {"people": [], "softwareSystems": [], "properties": {}},
+    "views": {"configuration": {"styles": {}}, "systemLandscapeViews": []},
+    "documentation": {"decisions": []},
+}
+
+
+def _run_all_workspace_impl(
+    app_code: str,
+    run_branch: str,
+    raw_body: bytes,
+    workspace: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Синхронная сердцевина POST /api/v1/run-all-workspace. Запускается в threadpool:
+    внутри — блокирующие БД, urllib и скрипты проверок.
+    """
+    try:
+        sz_creds = fetch_structurizr_credentials(app_code)
+    except CredentialsFetchError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    try:
+        doc_id = upload_workspace_json(raw_body)
+    except DocumentApiError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    doc_id_param = str(doc_id)
+
+    ff_app_map = get_fitness_function_applicabilities()
+    code_to_id = get_fitness_function_code_to_id()
+    excluded_run_all = get_fitness_function_codes_excluded_from_run_all()
+    all_codes = _runnable_ff_codes_ordered()
+
+    rows_by_code: dict[str, dict] = {}
+    for r in get_all_fitness_functions():
+        c = r.get("code")
+        if c and c not in rows_by_code:
+            rows_by_code[c] = r
+    # Асинхронные внешние проверки в этом режиме не запускаются: результат пришёл бы позже,
+    # а сохранять его некуда.
+    async_codes = {
+        c
+        for c, r in rows_by_code.items()
+        if (r.get("method") or "").strip() and not bool(r.get("method_synchronous"))
+    }
+
+    results: dict[str, Any] = {}
+    ran: set[str] = set()
+    passed_in_call: set[str] = set()
+
+    def _run_code(code: str) -> None:
+        ok, msg, check_result = run_ff_check_no_persist(
+            code,
+            app_code,
+            structurizr_credentials=sz_creds,
+            data=workspace,
+            doc_id=doc_id_param,
+            branch=run_branch,
+        )
+        row = rows_by_code.get(code)
+        results[code] = {
+            "success": ok,
+            "message": msg,
+            "check_result": check_result,
+            "status": fitness_function_status_from_row(row) if row else None,
+        }
+        ran.add(code)
+        if ok and isinstance(check_result, dict) and check_result.get("is_check") is True:
+            passed_in_call.add(code)
+
+    # 1) Сначала проверки без предусловий
+    for code in all_codes:
+        if code in async_codes or not _applicability_empty(ff_app_map.get(code)):
+            continue
+        _run_code(code)
+
+    # 2) Затем — с непустой applicability, когда предусловия выполнены
+    # (актуальный product_ff или успех проверки в этом же вызове)
+    while True:
+        batch = [
+            c
+            for c in all_codes
+            if c not in ran
+            and c not in async_codes
+            and not _applicability_empty(ff_app_map.get(c))
+            and _prerequisites_satisfied(
+                app_code,
+                ff_app_map.get(c),
+                code_to_id,
+                run_branch,
+                extra_passed=passed_in_call,
+            )
+        ]
+        if not batch:
+            break
+        for code in batch:
+            _run_code(code)
+
+    skipped = [
+        {
+            "code": c,
+            "reason": (
+                "асинхронная внешняя проверка (method_synchronous=false) "
+                "не запускается в режиме без сохранения результата"
+            ),
+        }
+        for c in all_codes
+        if c in async_codes
+    ]
+    skipped.extend(
+        {
+            "code": c,
+            "reason": "условия applicability не выполнены (нет актуальных product_ff с is_check=true)",
+        }
+        for c in all_codes
+        if c not in ran and c not in async_codes
+    )
+    skipped.extend(
+        {"code": c, "reason": "проверка со статусом TEST не входит в расчёт"}
+        for c in sorted(excluded_run_all)
+    )
+
+    out: dict[str, Any] = {
+        "app": app_code,
+        "branch": run_branch,
+        "docId": doc_id,
+        "results": results,
+        "skipped": skipped,
+    }
+    if not results:
+        out["message"] = (
+            "Ни одна проверка не запущена: не выполнены предусловия applicability, "
+            "проверки со статусом TEST или асинхронные внешние проверки"
+        )
+    return out
+
+
+@app.post(
+    "/api/v1/run-all-workspace",
+    responses=_openapi_client_errors(400, 405, 413, 422),
+)
+async def run_all_workspace(
+    request: Request,
+    app: str = Query(..., description="Мнемоника приложения (alias продукта)"),
+    branch: Optional[str] = Query(default=None, description=_BRANCH_QUERY_DESCRIPTION),
+    workspace: dict[str, Any] = Body(
+        ...,
+        description=(
+            "JSON-документ workspace (Structurizr) целиком — то же содержимое, что отдаёт "
+            "Structurizr по пути `/json`. Обёртка не используется: тело и есть workspace."
+        ),
+        openapi_examples={
+            "Пример workspace": {
+                "summary": "Минимальный workspace Structurizr",
+                "value": _WORKSPACE_BODY_EXAMPLE,
+            }
+        },
+    ),
+):
+    """
+    Расчёт всех проверок для продукта по **workspace.json в теле запроса**, без сохранения результатов.
+    Тело — сам JSON-документ workspace (Structurizr); мнемоника продукта — в query **app**, ветка — в **branch**.
+    Сервис сам создаёт документ в Documents API (`POST /api/v2/documents/workspace/json`) и передаёт
+    его **docId** синхронным внешним проверкам, а скриптам — workspace в **data**.
+    Запускаются проверки со статусом **TRIAL** / **ADOPT** (TEST исключаются).
+    **Applicability** учитывается по актуальным `product_ff` и по успешным результатам этого же вызова.
+    Асинхронные внешние проверки (`method_synchronous=false`) не запускаются — попадают в **skipped**.
+    Ничего не записывается: ни **product_ff**, ни **outside_ff**. Скрипты без `execute()`
+    (legacy, записывающие результат через `run_check()`) в этом режиме не запускаются.
+    Ошибка получения ключей Structurizr или создания документа — **502** (проверки не запускаются).
+    """
+    app_code = (app or "").strip()
+    if not app_code:
+        raise HTTPException(status_code=400, detail="Поле app не может быть пустым")
+    run_branch = _branch_from_query(branch)
+
+    too_large = (
+        "Тело запроса слишком большое: допускается не более "
+        f"{MAX_WORKSPACE_BODY_BYTES // (1024 * 1024)} МиБ (workspace.json)"
+    )
+    content_length = request.headers.get("content-length")
+    if (
+        content_length
+        and content_length.isdigit()
+        and int(content_length) > MAX_WORKSPACE_BODY_BYTES
+    ):
+        raise HTTPException(status_code=413, detail=too_large)
+
+    # Тело уже разобрано FastAPI (параметр workspace); сырые байты нужны, чтобы отдать
+    # в document-service ровно то, что прислал клиент.
+    raw_body = await request.body()
+    if len(raw_body) > MAX_WORKSPACE_BODY_BYTES:
+        raise HTTPException(status_code=413, detail=too_large)
+
+    return await run_in_threadpool(
+        _run_all_workspace_impl, app_code, run_branch, raw_body, workspace
+    )
 
 
 @app.get(
