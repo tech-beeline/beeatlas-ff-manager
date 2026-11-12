@@ -1,5 +1,6 @@
 # Copyright (c) 2024 PJSC VimpelCom
 """Слушатель очереди ff_change: CREATE и UPDATE fitness function запускают перерасчёт."""
+import base64
 import json
 import logging
 import threading
@@ -14,6 +15,40 @@ log = logging.getLogger(__name__)
 
 _QUEUE = "ff_change"
 _EXCHANGE = "Fitness_function"
+_token = None
+_token_exp = 0.0
+
+
+def _jwt_exp(token: str) -> float:
+    payload = token.split(".")[1]
+    padding = "=" * (-len(payload) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(payload + padding))
+    return float(claims["exp"])
+
+
+def _access_token() -> str:
+    global _token, _token_exp
+    if _token and time.time() < _token_exp:
+        return _token
+    url = (settings.authsso_server_url or "").strip()
+    if not url:
+        raise RuntimeError("INTEGRATION_AUTHSSO_SERVER_URL не задан")
+    log.info("Obtaining token...")
+    response = requests.post(url, timeout=30)
+    response.raise_for_status()
+    token = response.json()["access_token"]
+    _token = token
+    _token_exp = _jwt_exp(token)
+    log.info("Obtained token: %s", "****" + token[-4:])
+    return token
+
+
+def _rabbit_credentials():
+    import pika
+
+    if settings.ambassador_auth:
+        return pika.PlainCredentials("", _access_token())
+    return pika.PlainCredentials(settings.rabbit_user, settings.rabbit_password)
 
 
 def is_test_status(status) -> bool:
@@ -32,7 +67,7 @@ def _consume_forever() -> None:
         try:
             import pika
 
-            credentials = pika.PlainCredentials(settings.rabbit_user, settings.rabbit_password)
+            credentials = _rabbit_credentials()
             params = pika.ConnectionParameters(
                 host=settings.rabbit_host,
                 port=settings.rabbit_port,

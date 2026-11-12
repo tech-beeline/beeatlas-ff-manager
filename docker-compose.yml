@@ -30,6 +30,7 @@ services:
       FF_SCRIPTS_DIR: scripts
       # URL для колбэков (внешние проверки, скрипты с хоста): с хоста обычно http://localhost:8000
       FF_API_BASE_URL: http://localhost:8000
+      APP_AMBASSADOR_AUTH: "false"
     depends_on:
       db:
         condition: service_healthy

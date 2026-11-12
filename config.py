@@ -1,5 +1,6 @@
 # Copyright (c) 2024 PJSC VimpelCom
 """Конфигурация сервиса и подключения к БД."""
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -25,11 +26,13 @@ class Settings(BaseSettings):
     documents_api_base_url: str = ""
     # Таймаут загрузки документа в Documents API (тело workspace.json — несколько МБ)
     documents_api_timeout_seconds: float = 60.0
-    rabbit_host: str = "localhost"
-    rabbit_port: int = 5672
-    rabbit_user: str = "guest"
-    rabbit_password: str = "guest"
-    rabbit_virtual_host: str = "/"
+    rabbit_host: str = Field(default="localhost", validation_alias="SPRING_RABBITMQ_HOST")
+    rabbit_port: int = Field(default=5672, validation_alias="SPRING_RABBITMQ_PORT")
+    rabbit_user: str = Field(default="guest", validation_alias="SPRING_RABBITMQ_USERNAME")
+    rabbit_password: str = Field(default="guest", validation_alias="SPRING_RABBITMQ_PASSWORD")
+    rabbit_virtual_host: str = Field(default="/", validation_alias="SPRING_RABBITMQ_VIRTUAL_HOST")
+    ambassador_auth: bool = Field(default=True, validation_alias="APP_AMBASSADOR_AUTH")
+    authsso_server_url: str = Field(default="", validation_alias="INTEGRATION_AUTHSSO_SERVER_URL")
     bpm_url: str = ""
 
     @property
