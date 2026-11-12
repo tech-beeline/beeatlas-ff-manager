@@ -274,10 +274,10 @@ def set_fitness_function_status(code: str, new_status: str) -> Optional[dict]:
         cur.execute(
             f"""
             UPDATE {SCHEMA}.fitness_function
-            SET status = %s
+            SET status = %s, updated_date = %s
             WHERE id = %s
             """,
-            (status_norm, ff_id),
+            (status_norm, _server_now(), ff_id),
         )
     return get_fitness_function_by_code(key)
 
@@ -288,11 +288,30 @@ def get_fitness_function_by_code(code: str) -> Optional[dict]:
         cur.execute(
             f"""
             SELECT id, code, description, applicability, auxiliary_check, status, script, method,
-                   method_synchronous
+                   method_synchronous, created_date, updated_date
             FROM {SCHEMA}.fitness_function
             WHERE {_ff_code_equals_sql()}
             """,
             (code.strip(),),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["status"] = _row_ff_status(d)
+        return d
+
+
+def get_fitness_function_by_id(ff_id: int) -> Optional[dict]:
+    """code и status строки fitness_function по id или None."""
+    with get_cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT id, code, status
+            FROM {SCHEMA}.fitness_function
+            WHERE id = %s
+            """,
+            (ff_id,),
         )
         row = cur.fetchone()
         if row is None:
@@ -551,6 +570,8 @@ def add_fitness_function(
             if set_method_synchronous:
                 sets.append("method_synchronous = %s")
                 params.append(method_synchronous)
+            sets.append("updated_date = %s")
+            params.append(_server_now())
             params.append(ff_id)
             cur.execute(
                 f"""
@@ -567,8 +588,8 @@ def add_fitness_function(
             f"""
             INSERT INTO {SCHEMA}.fitness_function
                 (code, description, applicability, auxiliary_check, status, script, method,
-                 method_synchronous)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 method_synchronous, created_date)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -580,6 +601,7 @@ def add_fitness_function(
                 script if set_script else None,
                 method_value if set_method else None,
                 ms_val,
+                _server_now(),
             ),
         )
         new_row = cur.fetchone()
@@ -592,7 +614,7 @@ def get_all_fitness_functions() -> list[dict]:
         cur.execute(
             f"""
             SELECT id, code, description, applicability, auxiliary_check, status, script, method,
-                   method_synchronous
+                   method_synchronous, created_date, updated_date
             FROM {SCHEMA}.fitness_function
             ORDER BY id
             """
@@ -968,6 +990,14 @@ def init_schema():
         cur.execute(f"""
             ALTER TABLE {SCHEMA}.fitness_function
             ADD COLUMN IF NOT EXISTS method_synchronous BOOLEAN NOT NULL DEFAULT false;
+        """)
+        cur.execute(f"""
+            ALTER TABLE {SCHEMA}.fitness_function
+            ADD COLUMN IF NOT EXISTS created_date timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP;
+        """)
+        cur.execute(f"""
+            ALTER TABLE {SCHEMA}.fitness_function
+            ADD COLUMN IF NOT EXISTS updated_date timestamp without time zone;
         """)
         # Уникальность code: инвариант справочника ФФ, на нём же строится поиск по коду.
         cur.execute(f"""

@@ -62,6 +62,7 @@ from script_runner import (
     materialize_missing_fitness_functions_from_scripts,
     materialize_missing_scripts_from_db,
 )
+from ff_change_consumer import start_ff_change_listener
 
 app = FastAPI(title="FF Manager", description="Менеджер проверок архитектуры")
 
@@ -202,6 +203,8 @@ class FitnessFunctionItem(BaseModel):
         False,
         description="Если true и задан method — ответ HTTP обрабатывается сразу; иначе ожидается webhook",
     )
+    created_date: Optional[datetime] = None
+    updated_date: Optional[datetime] = None
 
 
 class FitnessFunctionUpsertResponse(BaseModel):
@@ -217,6 +220,8 @@ class FitnessFunctionUpsertResponse(BaseModel):
     script_attached: bool
     method: Optional[str] = None
     method_synchronous: bool = False
+    created_date: Optional[datetime] = None
+    updated_date: Optional[datetime] = None
 
 
 class ActualResultRow(BaseModel):
@@ -421,6 +426,7 @@ def startup():
         log.exception("init_bi_dashboards_schema failed, continuing startup without it")
     materialize_missing_fitness_functions_from_scripts()
     materialize_missing_scripts_from_db()
+    start_ff_change_listener()
 
 
 @app.get("/api/v1/")
@@ -771,6 +777,8 @@ async def _perform_fitness_function_upsert(
         "script_attached": attached,
         "method": method_stored,
         "method_synchronous": method_sync_stored,
+        "created_date": row.get("created_date") if row else None,
+        "updated_date": row.get("updated_date") if row else None,
     }
 
 
@@ -861,6 +869,8 @@ def _fitness_function_response_from_row(row: dict) -> dict:
         "status": fitness_function_status_from_row(row),
         "method": method_stored,
         "method_synchronous": bool(row.get("method_synchronous")),
+        "created_date": row.get("created_date"),
+        "updated_date": row.get("updated_date"),
     }
 
 

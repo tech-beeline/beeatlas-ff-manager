@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     documents_api_base_url: str = ""
     # Таймаут загрузки документа в Documents API (тело workspace.json — несколько МБ)
     documents_api_timeout_seconds: float = 60.0
+    rabbit_host: str = "localhost"
+    rabbit_port: int = 5672
+    rabbit_user: str = "guest"
+    rabbit_password: str = "guest"
+    rabbit_virtual_host: str = "/"
+    bpm_url: str = ""
 
     @property
     def database_url(self) -> str:
