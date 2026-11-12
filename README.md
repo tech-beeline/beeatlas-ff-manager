@@ -26,9 +26,10 @@ FF_API_BASE_URL=http://127.0.0.1:8000
 FF_EXTERNAL_FF_TIMEOUT_SECONDS=30
 FF_FDM_PRODUCT_API_BASE_URL=http://localhost:8084
 FF_DOCUMENTS_API_BASE_URL=
+FF_DOCUMENTS_API_TIMEOUT_SECONDS=60
 ```
 
-`FF_API_BASE_URL` — базовый URL сервиса для скриптов проверок (запись результата через API). `FF_EXTERNAL_FF_TIMEOUT_SECONDS` — таймаут HTTP POST при вызове внешней проверки (`fitness_function.method`). `FF_FDM_PRODUCT_API_BASE_URL` — URL products-service для получения `structurizrApiKey`/`Secret`. `FF_DOCUMENTS_API_BASE_URL` — базовый URL document-сервиса для загрузки документа по `docId` перед запуском FF.
+`FF_API_BASE_URL` — базовый URL сервиса для скриптов проверок (запись результата через API). `FF_EXTERNAL_FF_TIMEOUT_SECONDS` — таймаут HTTP POST при вызове внешней проверки (`fitness_function.method`). `FF_FDM_PRODUCT_API_BASE_URL` — URL products-service для получения `structurizrApiKey`/`Secret`. `FF_DOCUMENTS_API_BASE_URL` — базовый URL document-сервиса: загрузка документа по `docId` перед запуском FF и создание workspace-документа в `POST /api/v1/run-all-workspace` (`FF_DOCUMENTS_API_TIMEOUT_SECONDS` — таймаут этой загрузки).
 
 ## Запуск
 
@@ -57,11 +58,19 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 | GET | `/api/v1/ff/call/{callId}` | Статус/результат асинхронного вызова (для тестовых — детали без `product_ff`) |
 | POST | `/api/v1/run/{code}` | Запуск одной проверки для приложения; тело JSON: `{"app": "<мнемоника>"}`; query `docId` (опц.) |
 | POST | `/api/v1/run-all` | Запуск всех подходящих проверок; тело: `{"app": "<мнемоника>"}`; query `docId` (опц.) |
+| POST | `/api/v1/run-all-workspace` | Расчёт всех проверок (**TRIAL**/**ADOPT**) по **workspace.json** в теле запроса; query `app` (обяз.) и `branch`; ничего не сохраняется, асинхронные внешние проверки не запускаются |
 | POST | `/api/v1/ff/webhook` | Колбэк внешней проверки после вызова `method` |
 | POST | `/api/v1/product/{code}/ff` | Запись результата проверки в `product_ff` (используется скриптами через `run_check` в `_common.py`) |
 | GET | `/api/v1/product/{code}/actual-results` | Актуальные результаты по продукту: основные (по умолчанию) или вспомогательные (`?auxiliary=true`); без TEST |
 
 Запуск одной проверки: либо исполняется скрипт `{code}.py`, либо выполняется POST на URL из поля `method` в `fitness_function`. Проверки со статусом **TEST** не входят в `run-all`.
+
+`POST /api/v1/run-all-workspace` — «сухой» расчёт без сохранения: тело запроса — сам `workspace.json` (JSON-документ workspace), сервис создаёт документ в document-service (`POST /api/v2/documents/workspace/json?fileName=workspace.json&isPublic=true`), его `docId` уходит query-параметром синхронным внешним проверкам, а скриптам workspace передаётся в `data`. Запускаются только **TRIAL**/**ADOPT**; `applicability` проверяется по актуальным записям `product_ff` и по успешным результатам этого же вызова; асинхронные внешние проверки (`method_synchronous=false`) пропускаются. В `product_ff` и `outside_ff` ничего не записывается. Ограничение: скрипт без `execute()`, записывающий результат сам через `run_check()`, в этом режиме не запускается.
+
+```bash
+curl -X POST 'http://localhost:8000/api/v1/run-all-workspace?app=<alias>&branch=main' \
+  -H 'Content-Type: application/json' --data-binary @workspace.json
+```
 
 ### Ошибки клиента (4xx)
 

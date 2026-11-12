@@ -158,6 +158,56 @@ def run_ff_check(
     )
 
 
+def run_ff_check_no_persist(
+    code: str,
+    app_mnemonic: str,
+    *,
+    structurizr_credentials: Optional[Tuple[str, str]] = None,
+    data: Optional[dict[str, Any]] = None,
+    doc_id: Optional[str] = None,
+    branch: str = DEFAULT_BRANCH,
+) -> Tuple[bool, str, CheckResultPayload]:
+    """
+    Проверка без сохранения результата: аналог run_ff_check, но ничего не пишется в БД
+    (ни product_ff, ни outside_ff), а результат всегда возвращается в check_result.
+    Синхронные внешние проверки (method + method_synchronous=true) вызываются, doc_id уходит
+    query-параметром к URL method; асинхронные (method_synchronous=false) не запускаются.
+    """
+    row = get_fitness_function_by_code(code.strip())
+    canonical_code = (row.get("code") or code.strip()) if row else code.strip()
+    if row:
+        method = (row.get("method") or "").strip()
+        if method:
+            if not bool(row.get("method_synchronous")):
+                return (
+                    False,
+                    (
+                        f"Проверка '{canonical_code}' — асинхронная внешняя (method_synchronous=false); "
+                        "в режиме без сохранения результата не запускается."
+                    ),
+                    None,
+                )
+            return _invoke_external_post(
+                method,
+                row["id"],
+                app_mnemonic,
+                synchronous=True,
+                doc_id=doc_id,
+                is_test_mode=True,
+                branch=branch,
+                persist=False,
+            )
+
+    return run_script(
+        canonical_code,
+        app_mnemonic,
+        structurizr_credentials=structurizr_credentials,
+        data=data,
+        no_persist=True,
+        branch=branch,
+    )
+
+
 def _invoke_external_post(
     url: str,
     ff_id: int,
@@ -169,17 +219,36 @@ def _invoke_external_post(
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
     branch: str = DEFAULT_BRANCH,
+    persist: bool = True,
 ) -> Tuple[bool, str, CheckResultPayload]:
+    """persist=False — вызов без записи в outside_ff/product_ff (см. run_ff_check_no_persist)."""
+    if not synchronous and not persist:
+        return (
+            False,
+            (
+                "Асинхронная внешняя проверка (method_synchronous=false) не запускается "
+                "в режиме без сохранения результата."
+            ),
+            None,
+        )
+
     call_id = str(uuid.uuid4())
     product_code = app_mnemonic.strip()
-    insert_outside_ff_call(
-        ff_id=ff_id,
-        product_code=product_code,
-        call_id=call_id,
-        source_type=source_type,
-        source_id=source_id,
-        branch=branch,
-    )
+    if persist:
+        insert_outside_ff_call(
+            ff_id=ff_id,
+            product_code=product_code,
+            call_id=call_id,
+            source_type=source_type,
+            source_id=source_id,
+            branch=branch,
+        )
+
+    def discard_call() -> None:
+        """Снимает контекст вызова; в режиме без сохранения контекста и не было."""
+        if persist:
+            delete_outside_ff_by_call_id(call_id)
+
     target_url = _url_with_doc_id_query(url, doc_id)
     try:
         status, text = _post_json(
@@ -188,7 +257,7 @@ def _invoke_external_post(
             settings.external_ff_timeout_seconds,
         )
         if not (200 <= status < 300):
-            delete_outside_ff_by_call_id(call_id)
+            discard_call()
             detail = text.strip()[:500]
             return False, f"Внешний сервис вернул HTTP {status}" + (f": {detail}" if detail else ""), None
 
@@ -214,19 +283,20 @@ def _invoke_external_post(
                 text, call_id
             )
         except ValueError as e:
-            delete_outside_ff_by_call_id(call_id)
+            discard_call()
             return False, str(e), None
 
-        outcome = process_ff_webhook(
-            call_id,
-            is_check,
-            json_details=json_details,
-            count_detail=count_detail,
-            success_detail=success_detail,
-        )
-        if outcome == "not_found":
-            delete_outside_ff_by_call_id(call_id)
-            return False, "Внутренняя ошибка: запись outside_ff не найдена после вызова", None
+        if persist:
+            outcome = process_ff_webhook(
+                call_id,
+                is_check,
+                json_details=json_details,
+                count_detail=count_detail,
+                success_detail=success_detail,
+            )
+            if outcome == "not_found":
+                discard_call()
+                return False, "Внутренняя ошибка: запись outside_ff не найдена после вызова", None
 
         msg = f"Синхронная внешняя проверка выполнена (callId={call_id})."
         check_payload = check_result_from_stored_row(
@@ -235,10 +305,12 @@ def _invoke_external_post(
             count_detail=count_detail,
             success_detail=success_detail,
         )
-        if is_test_mode:
+        if not persist:
+            msg += " Результат не сохранён (режим без сохранения)."
+        elif is_test_mode:
             msg += " Результат не сохранён (статус TEST)."
         return True, msg, check_payload
 
     except (urllib.error.URLError, OSError, ValueError) as e:
-        delete_outside_ff_by_call_id(call_id)
+        discard_call()
         return False, f"Ошибка HTTP-запроса к внешнему URL: {e}", None

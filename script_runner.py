@@ -288,6 +288,7 @@ def run_script(
     data: Optional[dict[str, Any]] = None,
     *,
     is_test_mode: bool = False,
+    no_persist: bool = False,
     source_type: Optional[str] = None,
     source_id: Optional[str] = None,
     branch: str = DEFAULT_BRANCH,
@@ -297,6 +298,9 @@ def run_script(
     :param code: Код проверки (имя скрипта без .py), например SEQ01 или DEMOFF-1.
     :param app_mnemonic: Мнемоника приложения (строка).
     :param is_test_mode: статус TEST — результат не пишется в product_ff, детали в check_result.
+    :param no_persist: режим без сохранения результата: то же, что is_test_mode, но скрипт без
+        execute() (legacy-subprocess) не запускается вовсе — он может записать результат сам
+        (run_check() из _common), а в этом режиме записи быть не должно.
     :return: (успех, вывод скрипта или сообщение об ошибке, check_result или None).
     """
     # Приоритет источника правды — script в БД (если заполнен).
@@ -331,7 +335,7 @@ def run_script(
             app_mnemonic,
             env,
             data,
-            is_test_mode=is_test_mode,
+            is_test_mode=is_test_mode or no_persist,
             source_type=source_type,
             source_id=source_id,
             branch=branch,
@@ -340,6 +344,17 @@ def run_script(
             if not ok:
                 return False, out, None
             return True, out or "OK", check_from_execute
+
+        if no_persist:
+            return (
+                False,
+                out
+                or (
+                    "Скрипт без execute() в режиме без сохранения результата не запускается: "
+                    "он может записать результат в product_ff самостоятельно."
+                ),
+                None,
+            )
 
         result = subprocess.run(
             [sys.executable, str(path), app_mnemonic],

@@ -20,8 +20,11 @@ class Settings(BaseSettings):
     # Базовый URL API Structurizr для исходящих запросов из скриптов (HMAC)
     structurizr_http_base_url: str = ""
     structurizr_http_timeout_seconds: float = 30.0
-    # Базовый URL Documents API (GET /api/v1/documents/{document_id})
+    # Базовый URL Documents API (GET /api/v1/documents/{document_id},
+    # POST /api/v2/documents/{path_name}/{doc_type})
     documents_api_base_url: str = ""
+    # Таймаут загрузки документа в Documents API (тело workspace.json — несколько МБ)
+    documents_api_timeout_seconds: float = 60.0
 
     @property
     def database_url(self) -> str:
