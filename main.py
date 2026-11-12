@@ -874,6 +874,17 @@ def _fitness_function_response_from_row(row: dict) -> dict:
     }
 
 
+def _ff_name_from_row(row: Optional[dict]) -> Optional[str]:
+    """Человекочитаемое имя ФФ для ответов API: description без пробелов по краям."""
+    if not row:
+        return None
+    raw = row.get("description")
+    if raw is None:
+        return None
+    name = str(raw).strip()
+    return name or None
+
+
 @app.post(
     "/api/v1/fitness-function/{code}/status",
     summary="Установить статус проверки",
@@ -943,9 +954,10 @@ def _prerequisites_satisfied(
     return True
 
 
-def _runnable_ff_codes_ordered() -> list[str]:
+def _runnable_ff_codes_ordered(rows: Optional[list[dict]] = None) -> list[str]:
     """Коды проверок для run-all: внешние (method в БД), затем скрипты .py (в т.ч. только на диске); без test."""
-    rows = get_all_fitness_functions()
+    if rows is None:
+        rows = get_all_fitness_functions()
     disk = list_scripts()
     disk_set = set(disk)
     excluded_run_all = get_fitness_function_codes_excluded_from_run_all()
@@ -994,6 +1006,8 @@ def run_one(
     """
     Запуск проверки для продукта: скрипт .py или POST на URL из fitness_function.method.
     В теле запроса передаётся мнемоника приложения (поле app).
+    В ответе **code** и **name** — код и название проверки (`fitness_function.description`;
+    `name` = `null`, если записи в БД нет или описание пустое).
     Результат и applicability считаются для ветки **branch** (по умолчанию main).
     Для статуса **TEST** applicability не проверяется; результат не сохраняется в product_ff.
     Для **TRIAL** и **ADOPT** проверяется applicability.
@@ -1050,6 +1064,7 @@ def run_one(
         raise HTTPException(status_code=400, detail=message)
     out: dict[str, Any] = {
         "code": run_code,
+        "name": _ff_name_from_row(ff_row),
         "app": body.app,
         "branch": run_branch,
         "success": True,
@@ -1086,6 +1101,8 @@ def run_all(
     """
     Запуск проверок для приложения: скрипты .py и внешние POST (fitness_function.method).
     Проверки со статусом **TEST** не запускаются.
+    В **results** и **skipped** у каждой проверки есть **code** и **name**
+    (`name` — название из `fitness_function.description`, `null` — если записи в БД нет или описание пустое).
     Сначала — с applicability = NULL, затем остальные по мере выполнения предусловий в product_ff.
     В **check_result** каждой проверки — **details**, **countDetail**, **successDetail** (для любого статуса TRIAL/ADOPT).
     Результаты и applicability считаются для ветки **branch** (по умолчанию main).
@@ -1098,7 +1115,13 @@ def run_all(
     ff_app_map = get_fitness_function_applicabilities()
     code_to_id = get_fitness_function_code_to_id()
     excluded_run_all = get_fitness_function_codes_excluded_from_run_all()
-    all_codes = _runnable_ff_codes_ordered()
+    ff_rows = get_all_fitness_functions()
+    ff_by_code: dict[str, dict] = {}
+    for r in ff_rows:
+        c = r.get("code")
+        if c and c not in ff_by_code:
+            ff_by_code[c] = r
+    all_codes = _runnable_ff_codes_ordered(ff_rows)
 
     if not all_codes:
         return {
@@ -1127,11 +1150,6 @@ def run_all(
 
     results: dict = {}
     ran: set[str] = set()
-    ff_status_by_code = {
-        (r.get("code") or ""): fitness_function_status_from_row(r)
-        for r in get_all_fitness_functions()
-        if r.get("code")
-    }
 
     # 1) Сначала все с applicability NULL / пусто
     batch_null = [c for c in all_codes if _applicability_empty(ff_app_map.get(c))]
@@ -1146,11 +1164,14 @@ def run_all(
             source_id=run_source_id,
             branch=run_branch,
         )
+        row = ff_by_code.get(code)
         results[code] = {
+            "code": code,
+            "name": _ff_name_from_row(row),
             "success": ok,
             "message": msg,
             "check_result": check_result,
-            "status": ff_status_by_code.get(code, FF_STATUS_TEST),
+            "status": fitness_function_status_from_row(row) if row else FF_STATUS_TEST,
         }
         ran.add(code)
 
@@ -1176,21 +1197,32 @@ def run_all(
                 source_id=run_source_id,
                 branch=run_branch,
             )
+            row = ff_by_code.get(code)
             results[code] = {
+                "code": code,
+                "name": _ff_name_from_row(row),
                 "success": ok,
                 "message": msg,
                 "check_result": check_result,
-                "status": ff_status_by_code.get(code, FF_STATUS_TEST),
+                "status": fitness_function_status_from_row(row) if row else FF_STATUS_TEST,
             }
             ran.add(code)
 
     skipped = [
-        {"code": c, "reason": "условия applicability не выполнены (нет актуальных product_ff с is_check=true)"}
+        {
+            "code": c,
+            "name": _ff_name_from_row(ff_by_code.get(c)),
+            "reason": "условия applicability не выполнены (нет актуальных product_ff с is_check=true)",
+        }
         for c in all_codes
         if c not in ran
     ]
     skipped.extend(
-        {"code": c, "reason": "проверка со статусом TEST не входит в run-all"}
+        {
+            "code": c,
+            "name": _ff_name_from_row(ff_by_code.get(c)),
+            "reason": "проверка со статусом TEST не входит в run-all",
+        }
         for c in sorted(excluded_run_all)
     )
 
@@ -1249,10 +1281,11 @@ def _run_all_workspace_impl(
     ff_app_map = get_fitness_function_applicabilities()
     code_to_id = get_fitness_function_code_to_id()
     excluded_run_all = get_fitness_function_codes_excluded_from_run_all()
-    all_codes = _runnable_ff_codes_ordered()
+    ff_rows = get_all_fitness_functions()
+    all_codes = _runnable_ff_codes_ordered(ff_rows)
 
     rows_by_code: dict[str, dict] = {}
-    for r in get_all_fitness_functions():
+    for r in ff_rows:
         c = r.get("code")
         if c and c not in rows_by_code:
             rows_by_code[c] = r
@@ -1279,6 +1312,8 @@ def _run_all_workspace_impl(
         )
         row = rows_by_code.get(code)
         results[code] = {
+            "code": code,
+            "name": _ff_name_from_row(row),
             "success": ok,
             "message": msg,
             "check_result": check_result,
@@ -1319,6 +1354,7 @@ def _run_all_workspace_impl(
     skipped = [
         {
             "code": c,
+            "name": _ff_name_from_row(rows_by_code.get(c)),
             "reason": (
                 "асинхронная внешняя проверка (method_synchronous=false) "
                 "не запускается в режиме без сохранения результата"
@@ -1330,13 +1366,18 @@ def _run_all_workspace_impl(
     skipped.extend(
         {
             "code": c,
+            "name": _ff_name_from_row(rows_by_code.get(c)),
             "reason": "условия applicability не выполнены (нет актуальных product_ff с is_check=true)",
         }
         for c in all_codes
         if c not in ran and c not in async_codes
     )
     skipped.extend(
-        {"code": c, "reason": "проверка со статусом TEST не входит в расчёт"}
+        {
+            "code": c,
+            "name": _ff_name_from_row(rows_by_code.get(c)),
+            "reason": "проверка со статусом TEST не входит в расчёт",
+        }
         for c in sorted(excluded_run_all)
     )
 
@@ -1379,6 +1420,8 @@ async def run_all_workspace(
 ):
     """
     Расчёт всех проверок для продукта по **workspace.json в теле запроса**, без сохранения результатов.
+    В **results** и **skipped** у каждой проверки есть **code** и **name**
+    (`name` — название из `fitness_function.description`, `null` — если записи в БД нет или описание пустое).
     Тело — сам JSON-документ workspace (Structurizr); мнемоника продукта — в query **app**, ветка — в **branch**.
     Сервис сам создаёт документ в Documents API (`POST /api/v2/documents/workspace/json`) и передаёт
     его **docId** синхронным внешним проверкам, а скриптам — workspace в **data**.
@@ -1428,6 +1471,7 @@ def get_ff_call_result(call_id: str):
     - **pending** — webhook ещё не пришёл;
     - **call_status** — `pending` / `done` (состояние вызова outside_ff);
     - **status** — статус проверки TEST / TRIAL / ADOPT;
+    - **ff_name** — название проверки из `fitness_function.description`;
     - при **done** и TEST — **check_result** с деталями (без product_ff).
     """
     row = get_outside_ff_call(call_id)
@@ -1439,6 +1483,7 @@ def get_ff_call_result(call_id: str):
     base = {
         "callId": row["call_id"],
         "ff_code": row.get("ff_code"),
+        "ff_name": row.get("ff_name"),
         "product_code": row.get("product_code"),
         "branch": row.get("branch"),
         "status": row.get("ff_status") or FF_STATUS_TEST,
