@@ -55,7 +55,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 | GET | `/api/v1/fitness-functions` | Список записей `fitness_function` из БД |
 | PUT | `/api/v1/fitness-function/{code}` | Создание или обновление проверки (`multipart`, upsert; статус **TEST**) |
 | POST | `/api/v1/fitness-function/{code}/status` | Смена статуса: **TEST**, **TRIAL**, **ADOPT** |
-| GET | `/api/v1/ff/call/{callId}` | Статус/результат асинхронного вызова (для тестовых — детали без `product_ff`) |
+| GET | `/api/v1/ff/call/{callId}` | Статус/результат асинхронного вызова (для тестовых — детали без `product_ff`); в ответе `ff_code` и `ff_name` |
 | POST | `/api/v1/run/{code}` | Запуск одной проверки для приложения; тело JSON: `{"app": "<мнемоника>"}`; query `docId` (опц.) |
 | POST | `/api/v1/run-all` | Запуск всех подходящих проверок; тело: `{"app": "<мнемоника>"}`; query `docId` (опц.) |
 | POST | `/api/v1/run-all-workspace` | Расчёт всех проверок (**TRIAL**/**ADOPT**) по **workspace.json** в теле запроса; query `app` (обяз.) и `branch`; ничего не сохраняется, асинхронные внешние проверки не запускаются |
@@ -66,6 +66,8 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 Запуск одной проверки: либо исполняется скрипт `{code}.py`, либо выполняется POST на URL из поля `method` в `fitness_function`. Проверки со статусом **TEST** не входят в `run-all`.
 
 `POST /api/v1/run-all-workspace` — «сухой» расчёт без сохранения: тело запроса — сам `workspace.json` (JSON-документ workspace), сервис создаёт документ в document-service (`POST /api/v2/documents/workspace/json?fileName=workspace.json&isPublic=true`), его `docId` уходит query-параметром синхронным внешним проверкам, а скриптам workspace передаётся в `data`. Запускаются только **TRIAL**/**ADOPT**; `applicability` проверяется по актуальным записям `product_ff` и по успешным результатам этого же вызова; асинхронные внешние проверки (`method_synchronous=false`) пропускаются. В `product_ff` и `outside_ff` ничего не записывается. Ограничение: скрипт без `execute()`, записывающий результат сам через `run_check()`, в этом режиме не запускается.
+
+В ответе `run-all-workspace` (а также `run-all` и `run/{code}`) у каждой проверки есть `code` и `name`; `name` берётся из `fitness_function.description` и равен `null`, если записи в БД нет или описание пустое.
 
 ```bash
 curl -X POST 'http://localhost:8000/api/v1/run-all-workspace?app=<alias>&branch=main' \
