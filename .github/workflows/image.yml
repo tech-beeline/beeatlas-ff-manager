@@ -4,12 +4,11 @@ on:
   push:
     branches:
       - main
-    tags:
-      - '[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
   workflow_run:
     workflows:
       - Smoke test
+      - Java CI with Maven
     types:
       - completed
 
@@ -33,11 +32,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine image version
+      - name: Read version from .bumpversion.cfg
         id: version
         run: |
-          VERSION=$(git describe --tags 2>/dev/null || echo "dev")
+          VERSION=$(grep -E '^current_version[[:space:]]*=' .bumpversion.cfg | head -n1 | cut -d= -f2 | tr -d '[:space:]')
+          if [ -z "$VERSION" ]; then
+            echo "❌ Could not read current_version from .bumpversion.cfg"
+            exit 1
+          fi
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "ℹ️ Version: ${VERSION}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
