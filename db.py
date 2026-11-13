@@ -455,7 +455,7 @@ def get_outside_ff_call(call_id: str) -> Optional[dict]:
             f"""
             SELECT o.id, o.ff_id, o.product_code, o.branch, o.call_id, o.status,
                    o.is_check, o.json_details, o.count_detail, o.success_detail,
-                   ff.code AS ff_code, ff.status AS ff_status
+                   ff.code AS ff_code, ff.description AS ff_name, ff.status AS ff_status
             FROM {SCHEMA}.outside_ff o
             JOIN {SCHEMA}.fitness_function ff ON ff.id = o.ff_id
             WHERE o.call_id = %s
